@@ -23,7 +23,6 @@ type ChannelConfig struct {
 }
 
 type PaymentsConfig struct {
-	Enabled            bool
 	PaymentsServerKey  []byte
 	WalletPrivateKey   []byte
 	PaymentsListenAddr string
@@ -41,7 +40,34 @@ type Config struct {
 	TunnelThreads    uint
 	NetworkConfigUrl string
 	ExternalIP       string
+	PaymentsEnabled  bool
 	Payments         PaymentsConfig
+}
+
+type PaymentChain struct {
+	NodeKey     []byte
+	Fee         string
+	MaxCapacity string
+}
+
+type TunnelSectionPayment struct {
+	Chain              []PaymentChain
+	PricePerPacketNano uint64
+}
+
+type TunnelRouteSection struct {
+	Key     []byte
+	Payment *TunnelSectionPayment
+}
+
+type ClientConfig struct {
+	TunnelServerKey []byte
+	TunnelThreads   uint
+	PaymentsEnabled bool
+	Payments        PaymentsConfig
+	OutGateway      TunnelRouteSection
+	RouteOut        []TunnelRouteSection
+	RouteIn         []TunnelRouteSection
 }
 
 func checkIPAddress(ip string) string {
@@ -171,8 +197,8 @@ func LoadConfig(path string) (*Config, error) {
 			TunnelListenAddr: "0.0.0.0:17330",
 			NetworkConfigUrl: "https://ton-blockchain.github.io/global.config.json",
 			TunnelThreads:    uint(runtime.NumCPU()),
+			PaymentsEnabled:  false,
 			Payments: PaymentsConfig{
-				Enabled:            false,
 				PaymentsServerKey:  paymentsPrv.Seed(),
 				WalletPrivateKey:   priv.Seed(),
 				PaymentsListenAddr: "0.0.0.0:17331",
