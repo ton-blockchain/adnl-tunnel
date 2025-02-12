@@ -66,6 +66,7 @@ func PrepareTunnel(onRecv C.RecvCallback, next unsafe.Pointer, configJson *C.cha
 	// to not collect by gc
 	_gcAliveHolder[time.Now().UnixNano()] = tun
 
+	// TODO:this is straight implementation, with no optimizations
 	go func() {
 		buf := make([]byte, 2048)
 		for {
@@ -80,7 +81,7 @@ func PrepareTunnel(onRecv C.RecvCallback, next unsafe.Pointer, configJson *C.cha
 			aIP := a.IP.To4().String()
 			println("GO RECV", n, aIP, a.Port)
 
-			C.call_on_message((C.RecvCallback)(onRecv), next, C.CString(buf[:n]), C.size_t(n), C.CString(aIP), C.size_t(len(aIP)), C.ushort(a.Port))
+			C.call_on_message((C.RecvCallback)(onRecv), next, C.CString(string(buf[:n])), C.size_t(n), C.CString(aIP), C.size_t(len(aIP)), C.ushort(a.Port))
 		}
 	}()
 
