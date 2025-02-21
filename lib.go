@@ -142,7 +142,7 @@ func PrepareTunnel(onRecv C.RecvCallback, next unsafe.Pointer, configJson *C.cha
 
 	log.Info().Uint16("port", port).IPAddr("ip", ip).Msg("using tunnel")
 	return C.Tunnel{
-		index: len(_gcAliveHolder),
+		index: C.size_t(len(_gcAliveHolder)),
 		ip:    C.int(binary.BigEndian.Uint32(ip.To4())),
 		port:  C.int(port),
 	}
