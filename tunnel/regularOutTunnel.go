@@ -87,6 +87,7 @@ type RegularOutTunnel struct {
 	paymentSeqnoReceived uint64
 	pingSeqno            uint64
 	pingSeqnoReceived    uint64
+	pingSeqnoReinitAt    uint64
 
 	packetsToPrepay   int64
 	packetsPrepaidIn  int64
@@ -242,7 +243,7 @@ func (t *RegularOutTunnel) startSystemSender() {
 	case <-t.initSignal:
 	}
 
-	const CheckEvery = 3 * time.Second
+	const CheckEvery = 2 * time.Second
 
 	ticker := time.NewTicker(CheckEvery)
 
@@ -269,13 +270,13 @@ func (t *RegularOutTunnel) startSystemSender() {
 		var lastMsg *EncryptedMessage
 		if t.usePayments && t.paymentSeqnoReceived == t.paymentSeqno {
 			// we're paying for seqno, because packets arrive asynchronously, and we cannot know what is lost on the way
-			// so we trust seqno here, but validating it against received packets num, we agree for up to 20% loss
+			// so we trust seqno here, but validating it against received packets num, we agree for up to 33% loss
 			// if loss is higher we cannot trust this tunnel and will notify user and stop payments until normalization
 			received := atomic.LoadUint64(&t.packetsRecv)
 			paidUsed := atomic.LoadUint64(&t.packetsRecvPaidConsumed)
 			const LossNumAcceptable = 5000
-			if paidUsed > received+received/5+LossNumAcceptable {
-				t.log.Warn().Uint64("seqno", atomic.LoadUint64(&t.seqnoRecv)).Uint64("received", received).Msg("more than 20% incoming packets lost according to seqno, tunnel seems trying to cheat to get more payments")
+			if paidUsed > received+received/3+LossNumAcceptable {
+				t.log.Warn().Uint64("seqno", atomic.LoadUint64(&t.seqnoRecv)).Uint64("received", received).Msg("more than 33% incoming packets lost according to seqno, very unstable network or tunnel seems trying to cheat to get more payments")
 				continue
 			}
 
@@ -288,11 +289,45 @@ func (t *RegularOutTunnel) startSystemSender() {
 
 		lastMetaAt := atomic.LoadInt64(&t.lastFullyCheckedAt)
 		if lastMsg == nil && lastMetaAt+int64((CheckEvery/time.Second)/2)*3 < time.Now().Unix() {
-			if t.pingSeqno > 10 && time.Now().Unix()-lastMetaAt > 180 {
+			if t.pingSeqno-atomic.LoadUint64(&t.pingSeqnoReceived) > 3 && t.pingSeqno-t.pingSeqnoReinitAt > 3 {
+				if t.tunnelState != StateTypeConfiguring {
+					t.log.Info().Msg("tunnel looks disconnected, trying to reconfigure...")
+
+					// try to reconfigure tunnel in case server restart on one of the nodes on the way
+					if err = t.prepareInstructions(StateTypeConfiguring); err != nil {
+						t.log.Error().Err(err).Msg("prepare tunnel reconfigure instructions failed")
+						continue
+					}
+
+					t.peer.peer.Reinit()
+					t.pingSeqnoReinitAt = t.pingSeqno
+
+					for {
+						t.log.Info().Msg("sending tunnel reinit")
+
+						if _, err := t.WriteTo(nil, initAddr); err != nil {
+							t.log.Error().Err(err).Msg("write to reconfigure tunnel failed")
+							continue
+						}
+
+						select {
+						case <-t.closerCtx.Done():
+							return
+						case <-ticker.C:
+						}
+
+						if t.tunnelState > StateTypeConfiguring {
+							t.log.Info().Msg("tunnel reinitialized successfully")
+							break
+						}
+					}
+					continue
+				}
+
 				// if channel circle is not responds for 2 minutes, we consider channel as dead
-				_ = t.Close()
-				t.log.Error().Err(err).Msg("channel is not responding for 3 minutes or after first 10 pings, closing it")
-				return
+				//_ = t.Close()
+				//t.log.Error().Err(err).Msg("channel is not responding for 3 minutes or after first 10 pings, closing it")
+				//return
 			}
 
 			lastMsg, err = t.prepareTunnelPings()
@@ -768,6 +803,9 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 		}
 	case PingMeta:
 		atomic.StoreInt64(&t.lastFullyCheckedAt, time.Now().Unix())
+		if m.Seqno > atomic.LoadUint64(&t.pingSeqnoReceived) {
+			atomic.StoreUint64(&t.pingSeqnoReceived, m.Seqno)
+		}
 		return nil
 	case PaymentMeta:
 		for {
@@ -822,18 +860,9 @@ func (t *RegularOutTunnel) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 		IP:   packet.IP,
 		Port: int(packet.Port),
 	}, nil
+}
 
-	/*if t.rDeadline.IsZero() {
-		packet := <-t.read
-		return copy(p, packet.Payload), &net.UDPAddr{
-			IP:   packet.IP,
-			Port: int(packet.Port),
-		}, nil
-	}
-
-	ctx, cancel := context.WithDeadline(context.Background(), t.rDeadline)
-	defer cancel()
-
+func (t *RegularOutTunnel) ReadFromWithTimeout(ctx context.Context, p []byte) (n int, addr net.Addr, err error) {
 	select {
 	case packet := <-t.read:
 		return copy(p, packet.Payload), &net.UDPAddr{
@@ -841,8 +870,8 @@ func (t *RegularOutTunnel) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 			Port: int(packet.Port),
 		}, nil
 	case <-ctx.Done():
-		return -1, nil, fmt.Errorf("read timeout")
-	}*/
+		return -1, nil, ctx.Err()
+	}
 }
 
 func (t *RegularOutTunnel) requestPayment() {

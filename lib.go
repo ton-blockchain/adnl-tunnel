@@ -1,12 +1,21 @@
 package main
 
 /*
+typedef struct {
+	size_t index;
+	int ip;
+	int port;
+} Tunnel;
+
 // next - is pointer to class instance or callback to call method from node code
-typedef void (*RecvCallback)(void* next, const char * data, size_t data_len, const char * ip, size_t ip_len, unsigned short port);
+typedef void (*RecvCallback)(void* next, char * data, size_t num);
+
+typedef void (*PullSendCallback)(void* next, char * data, size_t num);
+
 
 // we need it because we cannot call C func by pointer directly from go
-static inline void call_on_message(RecvCallback cb, void* next, const char * data, size_t data_len, const char * ip, size_t ip_len, unsigned short port) {
-	cb(next, data, data_len, ip, ip_len, port);
+static inline void on_recv_batch_ready(RecvCallback cb, void* next, void* data, size_t num) {
+	cb(next, (char*)data, num);
 }
 */
 import "C"
@@ -15,6 +24,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -38,77 +48,138 @@ import (
 	"github.com/xssnick/tonutils-go/ton/wallet"
 	"math/big"
 	"net"
-	"net/netip"
 	"time"
 	"unsafe"
 )
 
-var _gcAliveHolder = map[int64]any{}
+var _gcAliveHolder []*tunnel.RegularOutTunnel
+
+// 16 bytes
+func writeSockAddr(at []byte, addr *net.UDPAddr) {
+	at[0], at[1] = 2, 0 // AF_INET
+
+	// port
+	at[2] = byte(addr.Port >> 8)
+	at[3] = byte(addr.Port & 0xff)
+
+	copy(at[4:], addr.IP.To4())
+}
+
+func parseSockAddr(at []byte) (*net.UDPAddr, error) {
+	if len(at) < 16 {
+		return nil, errors.New("length too short")
+	}
+
+	if at[0] != 2 || at[1] != 0 {
+		return nil, errors.New("only supports AF_INET addr")
+	}
+
+	return &net.UDPAddr{IP: at[4:8], Port: int(at[2])<<8 + int(at[3])}, nil
+}
 
 //export PrepareTunnel
-func PrepareTunnel(onRecv C.RecvCallback, next unsafe.Pointer, configJson *C.char, configJsonLen C.int, networkConfigJson *C.char, networkConfigJsonLen C.int) unsafe.Pointer {
+//goland:noinspection ALL
+func PrepareTunnel(onRecv C.RecvCallback, next unsafe.Pointer, configJson *C.char, configJsonLen C.int, networkConfigJson *C.char, networkConfigJsonLen C.int) C.Tunnel {
 	var cfg config.ClientConfig
 	if err := json.Unmarshal(C.GoBytes(unsafe.Pointer(configJson), configJsonLen), &cfg); err != nil {
-		panic("failed to parse tunnel config: " + err.Error())
+		println("failed to parse tunnel config: " + err.Error())
+		return C.Tunnel{}
 	}
 
 	var netCfg liteclient.GlobalConfig
 	if err := json.Unmarshal(C.GoBytes(unsafe.Pointer(networkConfigJson), networkConfigJsonLen), &netCfg); err != nil {
-		panic("failed to parse network config: " + err.Error())
+		println("failed to parse network config: " + err.Error())
+		return C.Tunnel{}
 	}
 
 	tun, port, ip, err := prepareTun(&cfg, &netCfg)
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to prepare tunnel")
-		return nil
+		log.Error().Err(err).Msg("failed to prepare tunnel")
+		return C.Tunnel{}
 	}
 
 	// to not collect by gc
-	_gcAliveHolder[time.Now().UnixNano()] = tun
+	_gcAliveHolder = append(_gcAliveHolder, tun)
 
-	// TODO:this is straight implementation, with no optimizations
 	go func() {
-		buf := make([]byte, 2048)
+		off, num := 0, 0
+		buf := make([]byte, (16+2+1500)*100)
+		sinceLastBatch := time.Now()
+		ctx, _ := context.WithTimeout(context.Background(), 20*time.Millisecond)
+
 		for {
-			n, addr, err := tun.ReadFrom(buf)
+			n, addr, err := tun.ReadFromWithTimeout(ctx, buf[off+18:])
 			if err != nil {
-				log.Debug().Err(err).Msg("failed to read from tunnel")
-				continue
+				if !errors.Is(err, context.DeadlineExceeded) {
+					println("FAIL TO READ", err.Error())
+					log.Debug().Err(err).Msg("failed to read from tunnel")
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+				// we reinit it when done to not create it for each packet read
+				// we need it to not lock batch for long time when there is no packets
+				ctx, _ = context.WithTimeout(context.Background(), 20*time.Millisecond)
 			}
-			_, _ = n, addr
 
-			a := addr.(*net.UDPAddr)
-			aIP := a.IP.To4().String()
-			println("GO RECV", n, aIP, a.Port)
+			if n > 0 {
+				writeSockAddr(buf[off:], addr.(*net.UDPAddr))
+				buf[off+16] = byte(n >> 8)
+				buf[off+17] = byte(n & 0xff)
 
-			C.call_on_message((C.RecvCallback)(onRecv), next, C.CString(string(buf[:n])), C.size_t(n), C.CString(aIP), C.size_t(len(aIP)), C.ushort(a.Port))
+				off += 18 + n
+				num++
+			}
+
+			if num >= 100 || (num > 0 && time.Since(sinceLastBatch) >= 10*time.Millisecond) {
+				// t := time.Now()
+				C.on_recv_batch_ready((C.RecvCallback)(onRecv), next, unsafe.Pointer(&buf[0]), C.size_t(num))
+				// println("BATCH READ PROCESS TOOK", time.Since(t).String(), num)
+				num, off = 0, 0
+				sinceLastBatch = time.Now()
+			}
 		}
 	}()
 
 	log.Info().Uint16("port", port).IPAddr("ip", ip).Msg("using tunnel")
-	return unsafe.Pointer(tun)
+	return C.Tunnel{
+		index: len(_gcAliveHolder),
+		ip:    C.int(binary.BigEndian.Uint32(ip.To4())),
+		port:  C.int(port),
+	}
 }
 
 //export WriteTunnel
-func WriteTunnel(tunPtr unsafe.Pointer, data *C.char, lnData C.int, ip *C.char, lnIp C.int, port C.ushort) C.int {
-	//goland:noinspection ALL
-	tun := (*tunnel.RegularOutTunnel)(tunPtr)
-
-	b := C.GoBytes(unsafe.Pointer(data), lnData)
-	ipBytes := C.GoBytes(unsafe.Pointer(ip), lnIp)
-
-	ipGo, ok := netip.AddrFromSlice(ipBytes)
-	if !ok {
-		log.Debug().Msg("invalid addr")
-		return -1
+func WriteTunnel(tunIdx C.size_t, data *C.char, num C.size_t) C.int {
+	if int(tunIdx) <= 0 || int(tunIdx) > len(_gcAliveHolder) {
+		return 0
 	}
-	addr := net.UDPAddrFromAddrPort(netip.AddrPortFrom(ipGo, uint16(port)))
 
-	_, err := tun.WriteTo(b, addr)
-	if err != nil {
-		log.Debug().Err(err).Msg("failed to write to tunnel")
-		return -1
+	tun := _gcAliveHolder[int(tunIdx)-1]
+
+	// convert to go slice but without copy, we don't cate about actual len so set it big
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(data)), 1<<31)
+	off := 0
+
+	// t := time.Now()
+	for i := 0; i < int(num); i++ {
+		addr, err := parseSockAddr(buf[off:])
+		if err != nil {
+			log.Error().Err(err).Msg("invalid sock addr when trying to send")
+
+			return 0
+		}
+
+		sz := int(buf[off+16])<<8 + int(buf[off+17])
+
+		if _, err = tun.WriteTo(buf[off+18:off+18+sz], addr); err != nil {
+			log.Debug().Err(err).Msg("failed to write to tunnel")
+			return -1
+		}
+
+		off += 18 + sz
 	}
+
+	// println("BATCH WRITTEN", num, time.Since(t).String())
 
 	return 1
 }
@@ -185,11 +256,9 @@ func prepareTun(cfg *config.ClientConfig, netCfg *liteclient.GlobalConfig) (*tun
 	zLogger := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger().Level(zerolog.InfoLevel)
 	log.Logger = zLogger
 
-	scanLog := zerolog.Nop()
-
 	var pay *tonpayments.Service
 	if cfg.PaymentsEnabled {
-		pay, err = preparePayerPayments(context.Background(), apiClient, dhtClient, cfg, scanLog)
+		pay, err = preparePayerPayments(context.Background(), apiClient, dhtClient, cfg, zLogger)
 		if err != nil {
 			return nil, 0, nil, fmt.Errorf("prepare payments failed: %w", err)
 		}

@@ -126,7 +126,7 @@ func main() {
 	}
 
 	var pmt tunnel.PaymentConfig
-	if cfg.Payments.Enabled {
+	if cfg.PaymentsEnabled {
 		log.Info().Msg("Initializing payment node on " + cfg.Payments.PaymentsListenAddr)
 		pm := preparePayments(context.Background(), gCfg, dhtClient, cfg)
 		go pm.Start()
@@ -165,6 +165,9 @@ func main() {
 		}
 	}()
 
+	speedPrinterCtx, cancelSp := context.WithCancel(context.Background())
+	cancelSp()
+
 	log.Info().Msg("Tunnel started, listening on " + cfg.TunnelListenAddr + " ADNL id is: " + base64.StdEncoding.EncodeToString(tunKey.Public().(ed25519.PublicKey)))
 	for {
 		log.Info().Msg("Input a command:")
@@ -176,6 +179,45 @@ func main() {
 		}
 
 		switch val {
+		case "speed":
+			select {
+			case <-speedPrinterCtx.Done():
+				speedPrinterCtx, cancelSp = context.WithCancel(context.Background())
+
+				go func() {
+					prev := tGate.GetPacketsStats()
+					for {
+						select {
+						case <-speedPrinterCtx.Done():
+							return
+						case <-time.After(time.Second * 1):
+							stats := tGate.GetPacketsStats()
+							for s, st := range stats {
+								if p := prev[s]; p != nil {
+									log.Info().Hex("section", []byte(s)).
+										Str("routed", calcSize(st.Routed-p.Routed)+"/s").
+										Str("sent", calcSize(st.Sent-p.Sent)+"/s").
+										Str("received", calcSize(st.Received-p.Received)+"/s").
+										Msg("per second")
+								}
+							}
+							prev = stats
+						}
+					}
+				}()
+
+			default:
+				cancelSp()
+			}
+		case "stats":
+			stats := tGate.GetPacketsStats()
+			for s, st := range stats {
+				log.Info().Hex("section", []byte(s)).
+					Str("routed", calcSize(st.Routed)).
+					Str("sent", calcSize(st.Sent)).
+					Str("received", calcSize(st.Received)).
+					Msg("stats summarized")
+			}
 		case "balance", "capacity":
 			if pmt.Service == nil {
 				log.Error().Msg("payments are not enabled")
@@ -207,6 +249,22 @@ func main() {
 		}
 
 	}
+}
+
+func calcSize(packets uint64) string {
+	const packetSize = 1200
+	sizes := []string{"B", "KB", "MB", "GB", "TB", "PB"}
+
+	b := packets * packetSize
+	sizeIndex := 0
+	sizeFloat := float64(b)
+
+	for sizeFloat >= 1024 && sizeIndex < len(sizes)-1 {
+		sizeFloat /= 1024
+		sizeIndex++
+	}
+
+	return fmt.Sprintf("%.2f %s", sizeFloat, sizes[sizeIndex])
 }
 
 func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClient *dht.Client, cfg *config.Config) *tonpayments.Service {
