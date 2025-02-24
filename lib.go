@@ -1,6 +1,8 @@
 package main
 
 /*
+#include <sys/socket.h>
+
 typedef struct {
 	size_t index;
 	int ip;
@@ -8,14 +10,18 @@ typedef struct {
 } Tunnel;
 
 // next - is pointer to class instance or callback to call method from node code
-typedef void (*RecvCallback)(void* next, char * data, size_t num);
+typedef void (*RecvCallback)(void* next, uint8_t* data, size_t num);
 
-typedef void (*PullSendCallback)(void* next, char * data, size_t num);
+typedef void (*ReinitCallback)(void* next, struct sockaddr* data);
 
 
 // we need it because we cannot call C func by pointer directly from go
 static inline void on_recv_batch_ready(RecvCallback cb, void* next, void* data, size_t num) {
-	cb(next, (char*)data, num);
+	cb(next, (uint8_t*)data, num);
+}
+
+static inline void on_reinit(ReinitCallback cb, void* next, void* data) {
+	cb(next, (struct sockaddr*)data);
 }
 */
 import "C"
@@ -79,7 +85,7 @@ func parseSockAddr(at []byte) (*net.UDPAddr, error) {
 
 //export PrepareTunnel
 //goland:noinspection ALL
-func PrepareTunnel(onRecv C.RecvCallback, next unsafe.Pointer, configJson *C.char, configJsonLen C.int, networkConfigJson *C.char, networkConfigJsonLen C.int) C.Tunnel {
+func PrepareTunnel(onRecv C.RecvCallback, onReinit C.ReinitCallback, nextOnRecv, nextOnReinit unsafe.Pointer, configJson *C.char, configJsonLen C.int, networkConfigJson *C.char, networkConfigJsonLen C.int) C.Tunnel {
 	var cfg config.ClientConfig
 	if err := json.Unmarshal(C.GoBytes(unsafe.Pointer(configJson), configJsonLen), &cfg); err != nil {
 		println("failed to parse tunnel config: " + err.Error())
@@ -98,12 +104,19 @@ func PrepareTunnel(onRecv C.RecvCallback, next unsafe.Pointer, configJson *C.cha
 		return C.Tunnel{}
 	}
 
+	tun.SetOutAddressChangedHandler(func(addr *net.UDPAddr) {
+		var buf [16]byte
+		writeSockAddr(buf[:], addr)
+
+		C.on_reinit((C.RecvCallback)(onReinit), nextOnReinit, unsafe.Pointer(&buf[0]))
+	})
+
 	// to not collect by gc
 	_gcAliveHolder = append(_gcAliveHolder, tun)
 
 	go func() {
 		off, num := 0, 0
-		buf := make([]byte, (16+2+1500)*100)
+		buf := make([]byte, (16+2+adnl.MaxMTU)*100)
 		sinceLastBatch := time.Now()
 		ctx, _ := context.WithTimeout(context.Background(), 20*time.Millisecond)
 
@@ -111,14 +124,18 @@ func PrepareTunnel(onRecv C.RecvCallback, next unsafe.Pointer, configJson *C.cha
 			n, addr, err := tun.ReadFromWithTimeout(ctx, buf[off+18:])
 			if err != nil {
 				if !errors.Is(err, context.DeadlineExceeded) {
-					println("FAIL TO READ", err.Error())
 					log.Debug().Err(err).Msg("failed to read from tunnel")
-					time.Sleep(50 * time.Millisecond)
+					time.Sleep(10 * time.Millisecond)
 					continue
 				}
 				// we reinit it when done to not create it for each packet read
 				// we need it to not lock batch for long time when there is no packets
 				ctx, _ = context.WithTimeout(context.Background(), 20*time.Millisecond)
+			}
+
+			if n > adnl.MaxMTU {
+				log.Debug().Msg("skip message bigger than max mtu")
+				continue
 			}
 
 			if n > 0 {
@@ -132,7 +149,7 @@ func PrepareTunnel(onRecv C.RecvCallback, next unsafe.Pointer, configJson *C.cha
 
 			if num >= 100 || (num > 0 && time.Since(sinceLastBatch) >= 10*time.Millisecond) {
 				// t := time.Now()
-				C.on_recv_batch_ready((C.RecvCallback)(onRecv), next, unsafe.Pointer(&buf[0]), C.size_t(num))
+				C.on_recv_batch_ready((C.RecvCallback)(onRecv), nextOnRecv, unsafe.Pointer(&buf[0]), C.size_t(num))
 				// println("BATCH READ PROCESS TOOK", time.Since(t).String(), num)
 				num, off = 0, 0
 				sinceLastBatch = time.Now()
@@ -149,7 +166,7 @@ func PrepareTunnel(onRecv C.RecvCallback, next unsafe.Pointer, configJson *C.cha
 }
 
 //export WriteTunnel
-func WriteTunnel(tunIdx C.size_t, data *C.char, num C.size_t) C.int {
+func WriteTunnel(tunIdx C.size_t, data *C.uint8_t, num C.size_t) C.int {
 	if int(tunIdx) <= 0 || int(tunIdx) > len(_gcAliveHolder) {
 		return 0
 	}

@@ -60,14 +60,16 @@ type RegularOutTunnel struct {
 	peer        *Peer
 	usePayments bool
 
-	tunnelState  uint32
-	initOnce     sync.Once
-	markPaidOnce sync.Once
-	initSignal   chan struct{}
-	paidSignal   chan struct{}
-	paySignal    chan struct{}
-	externalAddr net.IP
-	externalPort uint16
+	tunnelState       uint32
+	tunnelInitialized bool
+	markPaidOnce      sync.Once
+	initSignal        chan struct{}
+	paidSignal        chan struct{}
+	paySignal         chan struct{}
+	externalAddr      net.IP
+	externalPort      uint16
+
+	onOutAddressChanged func(addr *net.UDPAddr)
 
 	chainTo     []*SectionInfo
 	chainFrom   []*SectionInfo
@@ -234,6 +236,10 @@ func buildRoute(initial bool, msg *EncryptedMessage, cur, next *SectionInfo, pre
 	}
 
 	return nil
+}
+
+func (t *RegularOutTunnel) SetOutAddressChangedHandler(f func(addr *net.UDPAddr)) {
+	t.onOutAddressChanged = f
 }
 
 func (t *RegularOutTunnel) startSystemSender() {
@@ -786,17 +792,29 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 				return fmt.Errorf("read channel full")
 			}
 		case OutBindDonePayload:
-			t.initOnce.Do(func() {
-				t.mx.Lock()
-				defer t.mx.Unlock()
+			t.mx.Lock()
+			defer t.mx.Unlock()
 
-				t.externalAddr = p.IP
-				t.externalPort = uint16(p.Port)
+			if t.externalAddr.Equal(p.IP) && t.externalPort == uint16(p.Port) {
+				return nil
+			}
 
+			t.externalAddr = p.IP
+			t.externalPort = uint16(p.Port)
+
+			t.log.Info().Str("ip", net.IP(p.IP).String()).Uint32("port", p.Port).Msg("out gateway updated")
+
+			if !t.tunnelInitialized {
 				close(t.initSignal)
+			} else {
+				if f := t.onOutAddressChanged; f != nil {
+					f(&net.UDPAddr{
+						IP:   p.IP,
+						Port: int(p.Port),
+					})
+				}
+			}
 
-				t.log.Debug().Str("ip", net.IP(p.IP).String()).Uint32("port", p.Port).Msg("out bind done")
-			})
 			return nil
 		default:
 			return fmt.Errorf("incorrect payload type: %T", p)
