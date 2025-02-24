@@ -805,6 +805,7 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 			t.log.Info().Str("ip", net.IP(p.IP).String()).Uint32("port", p.Port).Msg("out gateway updated")
 
 			if !t.tunnelInitialized {
+				t.tunnelInitialized = true
 				close(t.initSignal)
 			} else {
 				if f := t.onOutAddressChanged; f != nil {
