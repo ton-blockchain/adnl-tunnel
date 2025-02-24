@@ -1,6 +1,7 @@
 package main
 
 /*
+#include <stdint.h>
 #include <sys/socket.h>
 
 typedef struct {
