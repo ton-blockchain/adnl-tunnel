@@ -401,6 +401,8 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		return fmt.Errorf("payments are not enabled")
 	}
 
+	// TODO: recover payments after restart
+
 	var st payments.VirtualChannelState
 	if err := tlb.LoadFromCell(&st, ins.PaymentChannelState.BeginParse()); err != nil {
 		return fmt.Errorf("incorrect state cell: %w", err)

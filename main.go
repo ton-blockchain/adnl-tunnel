@@ -195,9 +195,9 @@ func main() {
 							for s, st := range stats {
 								if p := prev[s]; p != nil {
 									log.Info().Hex("section", []byte(s)).
-										Str("routed", calcSize(st.Routed-p.Routed)+"/s").
-										Str("sent", calcSize(st.Sent-p.Sent)+"/s").
-										Str("received", calcSize(st.Received-p.Received)+"/s").
+										Str("routed", formatNum(st.Routed-p.Routed)+"/s").
+										Str("sent", formatNum(st.Sent-p.Sent)+"/s").
+										Str("received", formatNum(st.Received-p.Received)+"/s").
 										Msg("per second")
 								}
 							}
@@ -213,9 +213,9 @@ func main() {
 			stats := tGate.GetPacketsStats()
 			for s, st := range stats {
 				log.Info().Hex("section", []byte(s)).
-					Str("routed", calcSize(st.Routed)).
-					Str("sent", calcSize(st.Sent)).
-					Str("received", calcSize(st.Received)).
+					Str("routed", formatNum(st.Routed)).
+					Str("sent", formatNum(st.Sent)).
+					Str("received", formatNum(st.Received)).
 					Msg("stats summarized")
 			}
 		case "balance", "capacity":
@@ -251,20 +251,18 @@ func main() {
 	}
 }
 
-func calcSize(packets uint64) string {
-	const packetSize = 1200
-	sizes := []string{"B", "KB", "MB", "GB", "TB", "PB"}
+func formatNum(packets uint64) string {
+	sizes := []string{"", " K", " M", " B"}
 
-	b := packets * packetSize
 	sizeIndex := 0
-	sizeFloat := float64(b)
+	sizeFloat := float64(packets)
 
-	for sizeFloat >= 1024 && sizeIndex < len(sizes)-1 {
-		sizeFloat /= 1024
+	for sizeFloat >= 1000 && sizeIndex < len(sizes)-1 {
+		sizeFloat /= 1000
 		sizeIndex++
 	}
 
-	return fmt.Sprintf("%.2f %s", sizeFloat, sizes[sizeIndex])
+	return fmt.Sprintf("%.2f%s", sizeFloat, sizes[sizeIndex])
 }
 
 func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClient *dht.Client, cfg *config.Config) *tonpayments.Service {

@@ -156,7 +156,7 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 		log:             log,
 		closerCtx:       closerCtx,
 		close:           closer,
-		packetsToPrepay: 30000,
+		packetsToPrepay: 100000,
 	}
 
 	list := append([]*SectionInfo{}, chainTo...)
@@ -274,27 +274,9 @@ func (t *RegularOutTunnel) startSystemSender() {
 		lastTry = time.Now()
 
 		var lastMsg *EncryptedMessage
-		if t.usePayments && t.paymentSeqnoReceived == t.paymentSeqno {
-			// we're paying for seqno, because packets arrive asynchronously, and we cannot know what is lost on the way
-			// so we trust seqno here, but validating it against received packets num, we agree for up to 33% loss
-			// if loss is higher we cannot trust this tunnel and will notify user and stop payments until normalization
-			received := atomic.LoadUint64(&t.packetsRecv)
-			paidUsed := atomic.LoadUint64(&t.packetsRecvPaidConsumed)
-			const LossNumAcceptable = 5000
-			if paidUsed > received+received/3+LossNumAcceptable {
-				t.log.Warn().Uint64("seqno", atomic.LoadUint64(&t.seqnoRecv)).Uint64("received", received).Msg("more than 33% incoming packets lost according to seqno, very unstable network or tunnel seems trying to cheat to get more payments")
-				continue
-			}
-
-			lastMsg, err = t.prepareTunnelPayments()
-			if err != nil {
-				t.log.Error().Err(err).Msg("prepare tunnel payments failed")
-				continue
-			}
-		}
 
 		lastMetaAt := atomic.LoadInt64(&t.lastFullyCheckedAt)
-		if lastMsg == nil && lastMetaAt+int64((CheckEvery/time.Second)/2)*3 < time.Now().Unix() {
+		if lastMetaAt+int64((CheckEvery/time.Second)/2)*3 < time.Now().Unix() {
 			if t.pingSeqno-atomic.LoadUint64(&t.pingSeqnoReceived) > 3 && t.pingSeqno-t.pingSeqnoReinitAt > 3 {
 				if t.tunnelState != StateTypeConfiguring {
 					t.log.Info().Msg("tunnel looks disconnected, trying to reconfigure...")
@@ -323,17 +305,16 @@ func (t *RegularOutTunnel) startSystemSender() {
 						}
 
 						if t.tunnelState > StateTypeConfiguring {
+							// TODO: remove after payments recovery logic, this is temp
+							t.packetsPrepaidOut = 0
+							t.packetsPrepaidIn = 0
+
 							t.log.Info().Msg("tunnel reinitialized successfully")
 							break
 						}
 					}
 					continue
 				}
-
-				// if channel circle is not responds for 2 minutes, we consider channel as dead
-				//_ = t.Close()
-				//t.log.Error().Err(err).Msg("channel is not responding for 3 minutes or after first 10 pings, closing it")
-				//return
 			}
 
 			lastMsg, err = t.prepareTunnelPings()
@@ -341,10 +322,32 @@ func (t *RegularOutTunnel) startSystemSender() {
 				t.log.Error().Err(err).Msg("prepare tunnel pings failed")
 				continue
 			}
+		} else if t.usePayments {
+			received := atomic.LoadUint64(&t.packetsRecv)
+			paidUsed := atomic.LoadUint64(&t.packetsRecvPaidConsumed)
+
+			if t.paymentSeqnoReceived >= t.paymentSeqno {
+				// we're paying for seqno, because packets arrive asynchronously, and we cannot know what is lost on the way
+				// so we trust seqno here, but validating it against received packets num, we agree for up to 33% loss
+				// if loss is higher we cannot trust this tunnel and will notify user and stop payments until normalization
+				const LossNumAcceptable = 5000 // + 33%
+				if paidUsed > received+received/3+LossNumAcceptable {
+					t.log.Warn().Uint64("seqno", atomic.LoadUint64(&t.seqnoRecv)).Uint64("received", received).Msg("more than 33% incoming packets lost according to seqno, very unstable network or tunnel seems trying to cheat to get more payments")
+					continue
+				}
+
+				lastMsg, err = t.prepareTunnelPayments()
+				if err != nil {
+					t.log.Error().Err(err).Msg("prepare tunnel payments failed")
+					continue
+				}
+			}
+
+			loss := float64(paidUsed-received) / float64(paidUsed)
+			t.log.Info().Float64("loss", loss).Msg("current loss percent")
 		}
 
 		if lastMsg == nil {
-			// payments and pings are not needed
 			continue
 		}
 
