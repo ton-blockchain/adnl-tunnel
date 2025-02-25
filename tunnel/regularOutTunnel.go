@@ -308,6 +308,8 @@ func (t *RegularOutTunnel) startSystemSender() {
 							// TODO: remove after payments recovery logic, this is temp
 							t.packetsPrepaidOut = 0
 							t.packetsPrepaidIn = 0
+							t.seqnoRecv = 0
+							t.seqnoSend = 0
 
 							t.log.Info().Msg("tunnel reinitialized successfully")
 							break
