@@ -157,7 +157,11 @@ func main() {
 		}
 	}
 
-	tGate := tunnel.NewGateway(gate, dhtClient, tunKey, log.With().Str("component", "gateway").Logger(), pmt)
+	lvl := zerolog.InfoLevel
+	if *Verbosity >= 3 {
+		lvl = zerolog.DebugLevel
+	}
+	tGate := tunnel.NewGateway(gate, dhtClient, tunKey, log.With().Str("component", "gateway").Logger().Level(lvl), pmt)
 	go func() {
 		if err = tGate.Start(); err != nil {
 			log.Fatal().Err(err).Msg("tunnel gateway failed")

@@ -571,7 +571,7 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 					} else {
 						// final if not enough for full next payment
 						isFinal = new(big.Int).Add(stateAmount, regularAmount).Cmp(vc.Capacity) > 0
-						amtLeft = amtLeft.Sub(amtLeft, amtLeft)
+						amtLeft = big.NewInt(0)
 					}
 
 					st := &payments.VirtualChannelState{
@@ -596,6 +596,7 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 						pi.Purpose = (PaymentPurposeRoute << 32) | uint64(routeId)
 					}
 
+					t.log.Debug().Str("amount", st.Amount.String()).Hex("section_key", nodes[i].Keys.SectionPubKey).Msg("adding virtual channel payment state instruction")
 					instructions = append(instructions, pi)
 
 					// We do it this way for atomicity, because some error may happen during iteration,
@@ -631,8 +632,9 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 	for _, mutation := range mutations {
 		mutation()
 	}
-	atomic.AddInt64(&t.packetsPrepaidIn, toPrepayIn.Int64())
-	atomic.AddInt64(&t.packetsPrepaidOut, toPrepayOut.Int64())
+	// TODO: better prepay based on each section
+	atomic.AddInt64(&t.packetsPrepaidIn, toPrepayMax.Int64())
+	atomic.AddInt64(&t.packetsPrepaidOut, toPrepayMax.Int64())
 
 	t.log.Debug().Int("size", len(t.currentSendInstructions)).Msg("payment instructions prepared")
 

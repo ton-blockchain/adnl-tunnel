@@ -379,6 +379,7 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 
 			for i, inst := range sec.cachedActions {
 				if err := inst.Execute(g.closerCtx, sec, m.Payload); err != nil {
+					sec.log.Debug().Type("instruction", inst).Err(err).Msg("execute cached instruction failed")
 					return fmt.Errorf("execute cached action %d error: %w", i, err)
 				}
 			}
