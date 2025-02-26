@@ -21,6 +21,7 @@ import (
 	"github.com/xssnick/ton-payment-network/tonpayments/db/leveldb"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/adnl"
+	"github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -28,11 +29,10 @@ import (
 	"github.com/xssnick/tonutils-go/ton/wallet"
 	"math/big"
 	"net"
+	"net/netip"
 	"runtime"
 	"time"
 )
-
-import _ "net/http/pprof"
 
 var ConfigPath = flag.String("config", "config.json", "Config path")
 var PaymentNodeWith = flag.String("payment-node", "", "Payment node to open channel with")
@@ -82,14 +82,15 @@ func main() {
 		return
 	}
 
-	/*runtime.SetMutexProfileFraction(1)
-	go func() {
-		http.ListenAndServe(":6065", nil)
-	}()*/
-
 	threads := int(cfg.TunnelThreads)
 	if threads == 0 {
 		threads = runtime.NumCPU()
+	}
+
+	listenAddr, err := netip.ParseAddrPort(cfg.TunnelListenAddr)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Invalid listen address")
+		return
 	}
 
 	tunKey := ed25519.NewKeyFromSeed(cfg.TunnelServerKey)
@@ -100,7 +101,12 @@ func main() {
 			log.Fatal().Msg("Invalid external IP address")
 			return
 		}
-		gate.SetExternalIP(ip)
+		gate.SetAddressList([]*address.UDP{
+			{
+				IP:   ip,
+				Port: int32(listenAddr.Port()),
+			},
+		})
 	}
 
 	if err = gate.StartServer(cfg.TunnelListenAddr, threads); err != nil {
