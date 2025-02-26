@@ -118,7 +118,7 @@ func PrepareTunnel(cfg *config.ClientConfig, netCfg *liteclient.GlobalConfig) (*
 		}
 	}()
 
-	zLogger.Info().Msg("creating adnl...")
+	zLogger.Info().Msg("initializing adnl tunnel...")
 
 	tun, err := tGate.CreateRegularOutTunnel(context.Background(), chainTo, chainFrom, zLogger.With().Str("component", "tunnel").Logger())
 	if err != nil {

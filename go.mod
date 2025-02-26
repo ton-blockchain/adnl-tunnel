@@ -6,7 +6,7 @@ require (
 	github.com/kevinms/leakybucket-go v0.0.0-20200115003610-082473db97ca
 	github.com/rs/zerolog v1.33.0
 	github.com/xssnick/ton-payment-network v0.0.0-20250211055352-ed9cef403ce1
-	github.com/xssnick/tonutils-go v1.11.1-0.20250225174625-e20ed0d2b3e8
+	github.com/xssnick/tonutils-go v1.11.1
 )
 
 require (
@@ -18,6 +18,5 @@ require (
 	github.com/syndtr/goleveldb v1.0.0 // indirect
 	github.com/xssnick/raptorq v1.0.0 // indirect
 	golang.org/x/crypto v0.32.0 // indirect
-	golang.org/x/net v0.34.0 // indirect
 	golang.org/x/sys v0.29.0 // indirect
 )
