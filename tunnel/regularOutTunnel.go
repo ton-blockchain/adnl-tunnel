@@ -37,9 +37,8 @@ type VirtualPaymentChannel struct {
 }
 
 type PaymentTunnelSection struct {
-	Key         ed25519.PublicKey
-	Fee         *big.Int
-	MaxCapacity *big.Int
+	Key ed25519.PublicKey
+	Fee *big.Int
 }
 
 type Payer struct {

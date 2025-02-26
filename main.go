@@ -127,7 +127,7 @@ func main() {
 
 	var pmt tunnel.PaymentConfig
 	if cfg.PaymentsEnabled {
-		log.Info().Msg("Initializing payment node on " + cfg.Payments.PaymentsListenAddr)
+		log.Info().Msg("Initializing payment node ")
 		pm := preparePayments(context.Background(), gCfg, dhtClient, cfg)
 		go pm.Start()
 
@@ -290,23 +290,9 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 	nodePrv := ed25519.NewKeyFromSeed(cfg.Payments.PaymentsServerKey)
 	gate := adnl.NewGateway(nodePrv)
 
-	if cfg.ExternalIP != "" {
-		ip := net.ParseIP(cfg.ExternalIP)
-		if ip == nil {
-			log.Fatal().Msg("incorrect ip format")
-			return nil
-		}
-
-		gate.SetExternalIP(ip.To4())
-		if err := gate.StartServer(cfg.Payments.PaymentsListenAddr); err != nil {
-			log.Fatal().Err(err).Msg("failed to init adnl gateway")
-			return nil
-		}
-	} else {
-		if err := gate.StartClient(); err != nil {
-			log.Fatal().Err(err).Msg("failed to init adnl gateway")
-			return nil
-		}
+	if err := gate.StartClient(); err != nil {
+		log.Fatal().Err(err).Msg("failed to init adnl payments gateway")
+		return nil
 	}
 
 	walletPrv := ed25519.NewKeyFromSeed(cfg.Payments.WalletPrivateKey)

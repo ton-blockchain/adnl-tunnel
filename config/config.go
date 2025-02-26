@@ -23,12 +23,11 @@ type ChannelConfig struct {
 }
 
 type PaymentsConfig struct {
-	PaymentsServerKey  []byte
-	WalletPrivateKey   []byte
-	PaymentsListenAddr string
-	DBPath             string
-	SecureProofPolicy  bool
-	ChannelConfig      ChannelConfig
+	PaymentsServerKey []byte
+	WalletPrivateKey  []byte
+	DBPath            string
+	SecureProofPolicy bool
+	ChannelConfig     ChannelConfig
 
 	MinPricePerPacketRoute uint64
 	MinPricePerPacketInOut uint64
@@ -45,9 +44,8 @@ type Config struct {
 }
 
 type PaymentChain struct {
-	NodeKey     []byte
-	Fee         string
-	MaxCapacity string
+	NodeKey              []byte
+	FeePerVirtualChannel string
 }
 
 type TunnelSectionPayment struct {
@@ -199,13 +197,12 @@ func LoadConfig(path string) (*Config, error) {
 			TunnelThreads:    uint(runtime.NumCPU()),
 			PaymentsEnabled:  false,
 			Payments: PaymentsConfig{
-				PaymentsServerKey:  paymentsPrv.Seed(),
-				WalletPrivateKey:   priv.Seed(),
-				PaymentsListenAddr: "0.0.0.0:17331",
-				DBPath:             "./payments-db/",
-				SecureProofPolicy:  false,
+				PaymentsServerKey: paymentsPrv.Seed(),
+				WalletPrivateKey:  priv.Seed(),
+				DBPath:            "./payments-db/",
+				SecureProofPolicy: false,
 				ChannelConfig: ChannelConfig{
-					VirtualChannelProxyFee:      "0.01",
+					VirtualChannelProxyFee:      "0.0001",
 					QuarantineDurationSec:       600,
 					MisbehaviorFine:             "0.15",
 					ConditionalCloseDurationSec: 180,
@@ -238,7 +235,85 @@ func LoadConfig(path string) (*Config, error) {
 	return nil, err
 }
 
-func SaveConfig(cfg *Config, path string) error {
+func GenerateClientConfig(path string) (*ClientConfig, error) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	_, paymentsPrv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	_, tunnelPrv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	whKey := make([]byte, 32)
+	if _, err = rand.Read(whKey); err != nil {
+		return nil, err
+	}
+
+	tmp := make([]byte, 32)
+
+	cfg := &ClientConfig{
+		TunnelServerKey: tunnelPrv.Seed(),
+		TunnelThreads:   uint(runtime.NumCPU()),
+		PaymentsEnabled: false,
+		Payments: PaymentsConfig{
+			PaymentsServerKey: paymentsPrv.Seed(),
+			WalletPrivateKey:  priv.Seed(),
+			DBPath:            "./payments-db/",
+			SecureProofPolicy: false,
+			ChannelConfig: ChannelConfig{
+				VirtualChannelProxyFee:      "0.01",
+				QuarantineDurationSec:       600,
+				MisbehaviorFine:             "0.15",
+				ConditionalCloseDurationSec: 180,
+			},
+		},
+		OutGateway: TunnelRouteSection{
+			Key: tmp,
+			Payment: &TunnelSectionPayment{
+				Chain: []PaymentChain{
+					{
+						NodeKey:              tmp,
+						FeePerVirtualChannel: "0.0001",
+					},
+					{
+						NodeKey:              tmp,
+						FeePerVirtualChannel: "0",
+					},
+				},
+				PricePerPacketNano: 3,
+			},
+		},
+		RouteOut: []TunnelRouteSection{
+			{
+				Key:     tmp,
+				Payment: nil,
+			},
+		},
+		RouteIn: nil,
+	}
+
+	return cfg, SaveConfig(cfg, path)
+}
+
+func SaveConfig(cfg any, path string) error {
+	dir := filepath.Dir(path)
+	_, err := os.Stat(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			err = os.MkdirAll(dir, os.ModePerm)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to check directory: %w", err)
+		}
+	}
+
 	data, err := json.MarshalIndent(cfg, "", "\t")
 	if err != nil {
 		return err
