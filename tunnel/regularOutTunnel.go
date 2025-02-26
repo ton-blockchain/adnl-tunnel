@@ -275,36 +275,8 @@ func (t *RegularOutTunnel) startSystemSender() {
 
 		var lastMsg *EncryptedMessage
 
-		if t.usePayments {
-			received := atomic.LoadUint64(&t.packetsRecv)
-			paidUsed := atomic.LoadUint64(&t.packetsRecvPaidConsumed)
-
-			if t.paymentSeqnoReceived >= t.paymentSeqno {
-				// we're paying for seqno, because packets arrive asynchronously, and we cannot know what is lost on the way
-				// so we trust seqno here, but validating it against received packets num, we agree for up to 33% loss
-				// if loss is higher we cannot trust this tunnel and will notify user and stop payments until normalization
-				const LossNumAcceptable = 5000 // + 33%
-				if paidUsed > received+received/3+LossNumAcceptable {
-					t.log.Warn().Uint64("seqno", atomic.LoadUint64(&t.seqnoRecv)).Uint64("received", received).Msg("more than 33% incoming packets lost according to seqno, very unstable network or tunnel seems trying to cheat to get more payments")
-					continue
-				}
-
-				lastMsg, err = t.prepareTunnelPayments()
-				if err != nil {
-					t.log.Error().Err(err).Msg("prepare tunnel payments failed")
-					continue
-				}
-				lastPaymentMsg = lastMsg
-			} else {
-				lastMsg = lastPaymentMsg
-			}
-
-			loss := float64(paidUsed-received) / float64(paidUsed)
-			t.log.Info().Float64("loss", loss).Uint64("payments_seqno_diff", t.paymentSeqno-t.paymentSeqnoReceived).Int64("prepaid_out", t.packetsPrepaidOut).Int64("prepaid_in", t.packetsPrepaidIn).Msg("stats")
-		}
-
 		lastMetaAt := atomic.LoadInt64(&t.lastFullyCheckedAt)
-		if lastMsg == nil && lastMetaAt+int64((CheckEvery/time.Second)/2)*3 < time.Now().Unix() {
+		if lastMetaAt+int64((CheckEvery/time.Second)/2)*3 < time.Now().Unix() {
 			if t.pingSeqno-atomic.LoadUint64(&t.pingSeqnoReceived) > 3 && t.pingSeqno-t.pingSeqnoReinitAt > 3 {
 				if t.tunnelState != StateTypeConfiguring {
 					t.log.Info().Msg("tunnel looks disconnected, trying to reconfigure...")
@@ -352,6 +324,38 @@ func (t *RegularOutTunnel) startSystemSender() {
 				t.log.Error().Err(err).Msg("prepare tunnel pings failed")
 				continue
 			}
+		}
+
+		if t.usePayments && lastMsg == nil {
+			received := atomic.LoadUint64(&t.packetsRecv)
+			paidUsed := atomic.LoadUint64(&t.packetsRecvPaidConsumed)
+
+			if t.paymentSeqnoReceived >= t.paymentSeqno {
+				// we're paying for seqno, because packets arrive asynchronously, and we cannot know what is lost on the way
+				// so we trust seqno here, but validating it against received packets num, we agree for up to 33% loss
+				// if loss is higher we cannot trust this tunnel and will notify user and stop payments until normalization
+				const LossNumAcceptable = 5000 // + 33%
+				if paidUsed > received+received/3+LossNumAcceptable {
+					t.log.Warn().Uint64("seqno", atomic.LoadUint64(&t.seqnoRecv)).Uint64("received", received).Msg("more than 33% incoming packets lost according to seqno, very unstable network or tunnel seems trying to cheat to get more payments")
+					continue
+				}
+
+				lastMsg, err = t.prepareTunnelPayments()
+				if err != nil {
+					t.log.Error().Err(err).Msg("prepare tunnel payments failed")
+					continue
+				}
+				lastPaymentMsg = lastMsg
+			} else {
+				lastMsg = lastPaymentMsg
+			}
+
+			if lastMsg != nil {
+				t.log.Info().Uint64("seqno", t.paymentSeqno).Msg("sending payment")
+			}
+
+			loss := float64(paidUsed-received) / float64(paidUsed)
+			t.log.Info().Float64("loss", loss).Uint64("payments_seqno_diff", t.paymentSeqno-t.paymentSeqnoReceived).Int64("prepaid_out", t.packetsPrepaidOut).Int64("prepaid_in", t.packetsPrepaidIn).Msg("stats")
 		}
 
 		if lastMsg == nil {
@@ -736,6 +740,8 @@ func (t *RegularOutTunnel) prepareInstructions(state uint32) error {
 }
 
 func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
+	atomic.StoreInt64(&t.lastFullyCheckedAt, time.Now().Unix())
+
 	switch m := meta.(type) {
 	case StateMeta:
 		data, err := t.payloadKeys.decryptRecvPayload(payload)
@@ -833,7 +839,6 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 			return fmt.Errorf("incorrect payload type: %T", p)
 		}
 	case PingMeta:
-		atomic.StoreInt64(&t.lastFullyCheckedAt, time.Now().Unix())
 		if m.Seqno > atomic.LoadUint64(&t.pingSeqnoReceived) {
 			atomic.StoreUint64(&t.pingSeqnoReceived, m.Seqno)
 		}
@@ -848,7 +853,6 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 			}
 			break
 		}
-		atomic.StoreInt64(&t.lastFullyCheckedAt, time.Now().Unix())
 		t.markPaidOnce.Do(func() {
 			close(t.paidSignal)
 		})
