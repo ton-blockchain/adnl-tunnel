@@ -424,7 +424,8 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 			atomic.StoreInt64(&sec.lastPacketAt, time.Now().Unix())
 			for i, inst := range container.List {
 				if err = inst.(Instruction).Execute(g.closerCtx, sec, &m, restInstructions); err != nil {
-					sec.log.Debug().Int("index", i).Type("instruction", inst).Err(err).Msg("execute instruction failed")
+					sec.log.Debug().Type("instruction", inst).Err(err).Msg("execute instruction failed")
+					return fmt.Errorf("execute instruction %d (%T) error: %w", i, inst, err)
 				}
 			}
 		default:
