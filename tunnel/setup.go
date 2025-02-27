@@ -91,7 +91,6 @@ func PrepareTunnel(cfg *config.ClientConfig, netCfg *liteclient.GlobalConfig) (*
 	})
 
 	zLogger := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger().Level(zerolog.InfoLevel)
-	log.Logger = zLogger
 
 	var pay *tonpayments.Service
 	if cfg.PaymentsEnabled {

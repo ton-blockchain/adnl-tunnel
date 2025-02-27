@@ -31,6 +31,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/ton-blockchain/adnl-tunnel/config"
 	"github.com/ton-blockchain/adnl-tunnel/tunnel"
@@ -41,6 +42,10 @@ import (
 	"time"
 	"unsafe"
 )
+
+func init() {
+	log.Logger = zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger().Level(zerolog.InfoLevel)
+}
 
 var _gcAliveHolder []*tunnel.RegularOutTunnel
 
@@ -92,7 +97,7 @@ func PrepareTunnel(onRecv C.RecvCallback, onReinit C.ReinitCallback, nextOnRecv,
 
 	var netCfg liteclient.GlobalConfig
 	if err := json.Unmarshal(C.GoBytes(unsafe.Pointer(networkConfigJson), networkConfigJsonLen), &netCfg); err != nil {
-		println("failed to parse network config: " + err.Error())
+		log.Error().Err(err).Msg("failed to parse network config")
 		return C.Tunnel{}
 	}
 
