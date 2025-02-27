@@ -70,7 +70,7 @@ func parseSockAddr(at []byte) (*net.UDPAddr, error) {
 //export PrepareTunnel
 //goland:noinspection ALL
 func PrepareTunnel(onRecv C.RecvCallback, onReinit C.ReinitCallback, nextOnRecv, nextOnReinit unsafe.Pointer, configPath *C.char, configPathLen C.int, networkConfigJson *C.char, networkConfigJsonLen C.int) C.Tunnel {
-	path := C.GoString(unsafe.Pointer(configPath), configPathLen)
+	path := string(C.GoBytes(unsafe.Pointer(configPath), configPathLen))
 
 	data, err := os.ReadFile(path)
 	if err != nil {
