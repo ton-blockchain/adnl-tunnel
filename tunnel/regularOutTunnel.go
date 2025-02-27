@@ -351,11 +351,11 @@ func (t *RegularOutTunnel) startSystemSender() {
 			}
 
 			if lastMsg != nil {
-				t.log.Info().Uint64("seqno", t.paymentSeqno).Msg("sending payment")
+				t.log.Debug().Uint64("seqno", t.paymentSeqno).Msg("sending payment")
 			}
 
 			loss := float64(paidUsed-received) / float64(paidUsed)
-			t.log.Info().Float64("loss", loss).Uint64("payments_seqno_diff", t.paymentSeqno-t.paymentSeqnoReceived).Int64("prepaid_out", t.packetsPrepaidOut).Int64("prepaid_in", t.packetsPrepaidIn).Msg("stats")
+			t.log.Debug().Float64("loss", loss).Uint64("payments_seqno_diff", t.paymentSeqno-t.paymentSeqnoReceived).Int64("prepaid_out", t.packetsPrepaidOut).Int64("prepaid_in", t.packetsPrepaidIn).Msg("tunnel stats")
 		}
 
 		if lastMsg == nil {

@@ -37,6 +37,7 @@ import (
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"net"
+	"os"
 	"time"
 	"unsafe"
 )
@@ -68,11 +69,25 @@ func parseSockAddr(at []byte) (*net.UDPAddr, error) {
 
 //export PrepareTunnel
 //goland:noinspection ALL
-func PrepareTunnel(onRecv C.RecvCallback, onReinit C.ReinitCallback, nextOnRecv, nextOnReinit unsafe.Pointer, configJson *C.char, configJsonLen C.int, networkConfigJson *C.char, networkConfigJsonLen C.int) C.Tunnel {
+func PrepareTunnel(onRecv C.RecvCallback, onReinit C.ReinitCallback, nextOnRecv, nextOnReinit unsafe.Pointer, configPath *C.char, configPathLen C.int, networkConfigJson *C.char, networkConfigJsonLen C.int) C.Tunnel {
+	path := C.GoString(unsafe.Pointer(configPath), configPathLen)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if _, err = config.GenerateClientConfig(path); err != nil {
+				log.Error().Err(err).Msg("Failed to generate tunnel config")
+				os.Exit(1)
+			}
+			log.Info().Msg("Generated tunnel config; fill it with the desired route and restart")
+			os.Exit(0)
+		}
+		log.Fatal().Err(err).Msg("Failed to load tunnel config")
+	}
+
 	var cfg config.ClientConfig
-	if err := json.Unmarshal(C.GoBytes(unsafe.Pointer(configJson), configJsonLen), &cfg); err != nil {
-		println("failed to parse tunnel config: " + err.Error())
-		return C.Tunnel{}
+	if err = json.Unmarshal(data, &cfg); err != nil {
+		log.Fatal().Err(err).Msg("Failed to parse tunnel config")
 	}
 
 	var netCfg liteclient.GlobalConfig
