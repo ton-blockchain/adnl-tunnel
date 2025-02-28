@@ -40,12 +40,19 @@ func PrepareTunnel(cfg *config.ClientConfig, netCfg *liteclient.GlobalConfig) (*
 		return nil, 0, nil, fmt.Errorf("failed to generate TUN key: %w", err)
 	}
 
-	gate := adnl.NewGateway(tunKey)
+	conn, err := adnl.DefaultListener(":")
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("failed to bind listener: %w", err)
+	}
+
+	ml := adnl.NewMultiNetReader(conn)
+
+	gate := adnl.NewGatewayWithNetManager(tunKey, ml)
 	if err = gate.StartClient(8); err != nil {
 		return nil, 0, nil, fmt.Errorf("start gateway as client failed: %w", err)
 	}
 
-	dhtGate := adnl.NewGateway(dhtKey)
+	dhtGate := adnl.NewGatewayWithNetManager(dhtKey, ml)
 	if err = dhtGate.StartClient(); err != nil {
 		return nil, 0, nil, fmt.Errorf("start dht gateway failed: %w", err)
 	}
@@ -101,7 +108,7 @@ func PrepareTunnel(cfg *config.ClientConfig, netCfg *liteclient.GlobalConfig) (*
 
 		apiClient := ton.NewAPIClient(lsClient, ton.ProofCheckPolicyFast).WithRetry().WithTimeout(10 * time.Second)
 
-		pay, err = preparePayerPayments(context.Background(), apiClient, dhtClient, cfg, zLogger)
+		pay, err = preparePayerPayments(context.Background(), apiClient, dhtClient, cfg, zLogger, ml)
 		if err != nil {
 			return nil, 0, nil, fmt.Errorf("prepare payments failed: %w", err)
 		}
@@ -134,9 +141,9 @@ func PrepareTunnel(cfg *config.ClientConfig, netCfg *liteclient.GlobalConfig) (*
 	return tun, extPort, extIP, nil
 }
 
-func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, dhtClient *dht.Client, cfg *config.ClientConfig, logger zerolog.Logger) (*tonpayments.Service, error) {
+func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, dhtClient *dht.Client, cfg *config.ClientConfig, logger zerolog.Logger, manager adnl.NetManager) (*tonpayments.Service, error) {
 	nodePrv := ed25519.NewKeyFromSeed(cfg.Payments.PaymentsServerKey)
-	gate := adnl.NewGateway(nodePrv)
+	gate := adnl.NewGatewayWithNetManager(nodePrv, manager)
 
 	if err := gate.StartClient(); err != nil {
 		return nil, fmt.Errorf("failed to init adnl gateway: %w", err)

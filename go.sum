@@ -35,6 +35,8 @@ github.com/xssnick/ton-payment-network v0.0.0-20250211055352-ed9cef403ce1 h1:qm8
 github.com/xssnick/ton-payment-network v0.0.0-20250211055352-ed9cef403ce1/go.mod h1:HK2Gt9vHZ0mNA/z447N+icByDZxdXW+wPWYRdoWpHPw=
 github.com/xssnick/tonutils-go v1.11.1-0.20250226184842-e0277c2b08f8 h1:9RhGzJzg5tozyhebongcJ9rSlLdcCtoN/knbhNcGHTw=
 github.com/xssnick/tonutils-go v1.11.1-0.20250226184842-e0277c2b08f8/go.mod h1:Wj8TFiUUc7IGdLn2X/ZDzmMs/1b4fsF3iJzH/l+PXTI=
+github.com/xssnick/tonutils-go v1.11.1-0.20250228100230-8a484bd4b34f h1:K/CAjMMoOUy/ghsrUTKYACWKqxC7G1IEpQToM4d9/Co=
+github.com/xssnick/tonutils-go v1.11.1-0.20250228100230-8a484bd4b34f/go.mod h1:Wj8TFiUUc7IGdLn2X/ZDzmMs/1b4fsF3iJzH/l+PXTI=
 golang.org/x/crypto v0.32.0 h1:euUpcYgM8WcP71gNpTqQCn6rC2t6ULUPiOzfWaXVVfc=
 golang.org/x/crypto v0.32.0/go.mod h1:ZnnJkOaASj8g0AjIduWNlq2NRxL0PlBrbKVyZ6V/Ugc=
 golang.org/x/net v0.0.0-20180906233101-161cd47e91fd/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
@@ -155,7 +156,7 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 		log:             log,
 		closerCtx:       closerCtx,
 		close:           closer,
-		packetsToPrepay: 100000,
+		packetsToPrepay: 200000,
 	}
 
 	list := append([]*SectionInfo{}, chainTo...)
@@ -442,7 +443,7 @@ func (t *RegularOutTunnel) openVirtualChannel(p *Payer, capacity *big.Int) (*Vir
 	}, nil
 }
 
-const ChannelCapacityForNumPayments = 10
+const ChannelCapacityForNumPayments = 20
 
 func (t *RegularOutTunnel) calcPrepayNum(v int64) *big.Int {
 	toPrepay := big.NewInt(t.packetsToPrepay)
@@ -551,7 +552,7 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 
 				chIndex := 0
 				for amtLeft := new(big.Int).Mul(toPrepay, new(big.Int).SetUint64(p.PricePerPacket)); amtLeft.Sign() > 0; {
-					if chIndex >= 2 {
+					if chIndex >= 3 {
 						return nil, fmt.Errorf("too many payment channels consumed for single payment")
 					}
 
@@ -871,6 +872,7 @@ func (t *RegularOutTunnel) WaitForInit(ctx context.Context) (net.IP, uint16, err
 		case <-t.initSignal:
 			if t.usePayments {
 				t.requestPayment()
+				log.Info().Msg("adnl tunnel initialized, waiting payment confirmation...")
 
 				select {
 				case <-ctx.Done():

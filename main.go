@@ -103,7 +103,7 @@ func main() {
 		}
 		gate.SetAddressList([]*address.UDP{
 			{
-				IP:   ip,
+				IP:   ip.To4(),
 				Port: int32(listenAddr.Port()),
 			},
 		})
