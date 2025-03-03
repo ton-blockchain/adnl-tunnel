@@ -401,6 +401,8 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		return fmt.Errorf("payments are not enabled")
 	}
 
+	// TODO: recover payments after restart
+
 	var st payments.VirtualChannelState
 	if err := tlb.LoadFromCell(&st, ins.PaymentChannelState.BeginParse()); err != nil {
 		return fmt.Errorf("incorrect state cell: %w", err)
@@ -615,8 +617,13 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		return fmt.Errorf("calculate shared_payload key for out failed: %w", err)
 	}
 
-	if s.gw.payments.MinPricePerPacketInOut > ins.PricePerPacket {
+	if s.gw.payments.Service != nil && s.gw.payments.MinPricePerPacketInOut > ins.PricePerPacket {
 		return fmt.Errorf("too low price per packet: %d, min is %d and %d", ins.PricePerPacket, s.gw.payments.MinPricePerPacketInOut)
+	}
+
+	if s.gw.payments.Service == nil {
+		// if we have no payments enabled, just ignore price
+		ins.PricePerPacket = 0
 	}
 
 	if s.out == nil {

@@ -201,8 +201,42 @@ func NewGateway(gate *adnl.Gateway, dht *dht.Client, key ed25519.PrivateKey, log
 	}
 }
 
+type SectionStats struct {
+	Routed   uint64
+	Sent     uint64
+	Received uint64
+}
+
+func (g *Gateway) GetPacketsStats() map[string]*SectionStats {
+	tmp := map[string]*Section{}
+	res := map[string]*SectionStats{}
+
+	g.mx.RLock()
+	for s, section := range g.inboundSections {
+		tmp[s] = section
+	}
+	g.mx.RUnlock()
+
+	for s, section := range tmp {
+		stats := &SectionStats{}
+		res[s] = stats
+
+		section.mx.RLock()
+		for _, route := range section.routes {
+			stats.Routed += atomic.LoadUint64(&route.PacketsRouted)
+		}
+		if section.out != nil {
+			stats.Sent = atomic.LoadUint64(&section.out.PacketsSentOut)
+			stats.Received = atomic.LoadUint64(&section.out.PacketsSentIn)
+		}
+		section.mx.RUnlock()
+	}
+
+	return res
+}
+
 func (g *Gateway) Start() error {
-	g.gate.SetConnectionHandler(func(client adnl.Peer) error {
+	connHandler := func(client adnl.Peer) error {
 		id := string(client.GetID())
 		client.SetDisconnectHandler(func(addr string, key ed25519.PublicKey) {
 			g.mx.Lock()
@@ -223,7 +257,16 @@ func (g *Gateway) Start() error {
 		}
 		g.mx.Unlock()
 		return nil
-	})
+	}
+
+	g.gate.SetConnectionHandler(connHandler)
+	// process previously connected peers
+	for _, peer := range g.gate.GetActivePeers() {
+		if err := connHandler(peer); err != nil {
+			g.log.Warn().Err(err).Msg("failed to bootstrap already active peer")
+			continue
+		}
+	}
 
 	go func() {
 		var after time.Duration = 0
@@ -334,8 +377,10 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 				return fmt.Errorf("cache is empty")
 			}
 
+			atomic.StoreInt64(&sec.lastPacketAt, time.Now().Unix())
 			for i, inst := range sec.cachedActions {
 				if err := inst.Execute(g.closerCtx, sec, m.Payload); err != nil {
+					sec.log.Debug().Type("instruction", inst).Err(err).Msg("execute cached instruction failed")
 					return fmt.Errorf("execute cached action %d error: %w", i, err)
 				}
 			}
@@ -380,7 +425,8 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 			atomic.StoreInt64(&sec.lastPacketAt, time.Now().Unix())
 			for i, inst := range container.List {
 				if err = inst.(Instruction).Execute(g.closerCtx, sec, &m, restInstructions); err != nil {
-					return fmt.Errorf("execute instruction %d (%T) error: %w", i, inst, err)
+					sec.log.Debug().Int("index", i).Type("instruction", inst).Err(err).Msg("execute instruction failed")
+					// return fmt.Errorf("execute instruction %d (%T) error: %w", i, inst, err)
 				}
 			}
 		default:

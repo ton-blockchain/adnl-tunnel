@@ -21,6 +21,7 @@ import (
 	"github.com/xssnick/ton-payment-network/tonpayments/db/leveldb"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/adnl"
+	"github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -28,11 +29,10 @@ import (
 	"github.com/xssnick/tonutils-go/ton/wallet"
 	"math/big"
 	"net"
+	"net/netip"
 	"runtime"
 	"time"
 )
-
-import _ "net/http/pprof"
 
 var ConfigPath = flag.String("config", "config.json", "Config path")
 var PaymentNodeWith = flag.String("payment-node", "", "Payment node to open channel with")
@@ -82,14 +82,15 @@ func main() {
 		return
 	}
 
-	/*runtime.SetMutexProfileFraction(1)
-	go func() {
-		http.ListenAndServe(":6065", nil)
-	}()*/
-
 	threads := int(cfg.TunnelThreads)
 	if threads == 0 {
 		threads = runtime.NumCPU()
+	}
+
+	listenAddr, err := netip.ParseAddrPort(cfg.TunnelListenAddr)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Invalid listen address")
+		return
 	}
 
 	tunKey := ed25519.NewKeyFromSeed(cfg.TunnelServerKey)
@@ -100,7 +101,12 @@ func main() {
 			log.Fatal().Msg("Invalid external IP address")
 			return
 		}
-		gate.SetExternalIP(ip)
+		gate.SetAddressList([]*address.UDP{
+			{
+				IP:   ip.To4(),
+				Port: int32(listenAddr.Port()),
+			},
+		})
 	}
 
 	if err = gate.StartServer(cfg.TunnelListenAddr, threads); err != nil {
@@ -126,8 +132,8 @@ func main() {
 	}
 
 	var pmt tunnel.PaymentConfig
-	if cfg.Payments.Enabled {
-		log.Info().Msg("Initializing payment node on " + cfg.Payments.PaymentsListenAddr)
+	if cfg.PaymentsEnabled {
+		log.Info().Msg("Initializing payment node ")
 		pm := preparePayments(context.Background(), gCfg, dhtClient, cfg)
 		go pm.Start()
 
@@ -157,13 +163,20 @@ func main() {
 		}
 	}
 
-	tGate := tunnel.NewGateway(gate, dhtClient, tunKey, log.With().Str("component", "gateway").Logger(), pmt)
+	lvl := zerolog.InfoLevel
+	if *Verbosity >= 3 {
+		lvl = zerolog.DebugLevel
+	}
+	tGate := tunnel.NewGateway(gate, dhtClient, tunKey, log.With().Str("component", "gateway").Logger().Level(lvl), pmt)
 	go func() {
 		if err = tGate.Start(); err != nil {
 			log.Fatal().Err(err).Msg("tunnel gateway failed")
 			return
 		}
 	}()
+
+	speedPrinterCtx, cancelSp := context.WithCancel(context.Background())
+	cancelSp()
 
 	log.Info().Msg("Tunnel started, listening on " + cfg.TunnelListenAddr + " ADNL id is: " + base64.StdEncoding.EncodeToString(tunKey.Public().(ed25519.PublicKey)))
 	for {
@@ -176,6 +189,45 @@ func main() {
 		}
 
 		switch val {
+		case "speed":
+			select {
+			case <-speedPrinterCtx.Done():
+				speedPrinterCtx, cancelSp = context.WithCancel(context.Background())
+
+				go func() {
+					prev := tGate.GetPacketsStats()
+					for {
+						select {
+						case <-speedPrinterCtx.Done():
+							return
+						case <-time.After(time.Second * 1):
+							stats := tGate.GetPacketsStats()
+							for s, st := range stats {
+								if p := prev[s]; p != nil {
+									log.Info().Hex("section", []byte(s)).
+										Str("routed", formatNum(st.Routed-p.Routed)+"/s").
+										Str("sent", formatNum(st.Sent-p.Sent)+"/s").
+										Str("received", formatNum(st.Received-p.Received)+"/s").
+										Msg("per second")
+								}
+							}
+							prev = stats
+						}
+					}
+				}()
+
+			default:
+				cancelSp()
+			}
+		case "stats":
+			stats := tGate.GetPacketsStats()
+			for s, st := range stats {
+				log.Info().Hex("section", []byte(s)).
+					Str("routed", formatNum(st.Routed)).
+					Str("sent", formatNum(st.Sent)).
+					Str("received", formatNum(st.Received)).
+					Msg("stats summarized")
+			}
 		case "balance", "capacity":
 			if pmt.Service == nil {
 				log.Error().Msg("payments are not enabled")
@@ -209,6 +261,20 @@ func main() {
 	}
 }
 
+func formatNum(packets uint64) string {
+	sizes := []string{"", " K", " M", " B"}
+
+	sizeIndex := 0
+	sizeFloat := float64(packets)
+
+	for sizeFloat >= 1000 && sizeIndex < len(sizes)-1 {
+		sizeFloat /= 1000
+		sizeIndex++
+	}
+
+	return fmt.Sprintf("%.2f%s", sizeFloat, sizes[sizeIndex])
+}
+
 func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClient *dht.Client, cfg *config.Config) *tonpayments.Service {
 	client := liteclient.NewConnectionPool()
 
@@ -234,23 +300,9 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 	nodePrv := ed25519.NewKeyFromSeed(cfg.Payments.PaymentsServerKey)
 	gate := adnl.NewGateway(nodePrv)
 
-	if cfg.ExternalIP != "" {
-		ip := net.ParseIP(cfg.ExternalIP)
-		if ip == nil {
-			log.Fatal().Msg("incorrect ip format")
-			return nil
-		}
-
-		gate.SetExternalIP(ip.To4())
-		if err := gate.StartServer(cfg.Payments.PaymentsListenAddr); err != nil {
-			log.Fatal().Err(err).Msg("failed to init adnl gateway")
-			return nil
-		}
-	} else {
-		if err := gate.StartClient(); err != nil {
-			log.Fatal().Err(err).Msg("failed to init adnl gateway")
-			return nil
-		}
+	if err := gate.StartClient(); err != nil {
+		log.Fatal().Err(err).Msg("failed to init adnl payments gateway")
+		return nil
 	}
 
 	walletPrv := ed25519.NewKeyFromSeed(cfg.Payments.WalletPrivateKey)
