@@ -377,6 +377,7 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 				return fmt.Errorf("cache is empty")
 			}
 
+			atomic.StoreInt64(&sec.lastPacketAt, time.Now().Unix())
 			for i, inst := range sec.cachedActions {
 				if err := inst.Execute(g.closerCtx, sec, m.Payload); err != nil {
 					sec.log.Debug().Type("instruction", inst).Err(err).Msg("execute cached instruction failed")

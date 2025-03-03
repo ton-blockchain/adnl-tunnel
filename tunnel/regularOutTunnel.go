@@ -553,6 +553,7 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 				chIndex := 0
 				for amtLeft := new(big.Int).Mul(toPrepay, new(big.Int).SetUint64(p.PricePerPacket)); amtLeft.Sign() > 0; {
 					if chIndex >= 3 {
+						// TODO: not like this, maybe one bigger channel
 						return nil, fmt.Errorf("too many payment channels consumed for single payment")
 					}
 
