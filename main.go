@@ -330,7 +330,7 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 	}
 
 	inv := make(chan any)
-	sc := chain.NewScanner(apiClient, payments.AsyncPaymentChannelCodeHash, seqno, scanLog)
+	sc := chain.NewScanner(apiClient, payments.PaymentChannelCodeHash, seqno, scanLog)
 	if err = sc.Start(context.Background(), inv); err != nil {
 		log.Fatal().Err(err).Msg("failed to start chain scanner")
 		return nil
@@ -415,12 +415,34 @@ func preparePaymentChannel(ctx context.Context, pmt *tonpayments.Service, ch []b
 	}
 
 	ctxTm, cancel := context.WithTimeout(context.Background(), 150*time.Second)
-	addr, err := pmt.DeployChannelWithNode(ctxTm, amt, ch, nil)
+	addr, err := pmt.DeployChannelWithNode(ctxTm, ch, nil, 0)
 	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("failed to deploy channel with node: %w", err)
 	}
-	log.Info().Str("address", addr.String()).Msg("onchain channel deployed")
+	log.Info().Msg("Onchain channel deployed at address: " + addr.String() + " waiting for states exchange...")
+
+	for {
+		channel, err := pmt.GetChannel(context.Background(), addr.String())
+		if err != nil {
+			return nil, fmt.Errorf("failed to get channel: %w", err)
+		}
+
+		if !channel.Our.IsReady() || !channel.Their.IsReady() {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		break
+	}
+	log.Info().Msg("Channel states exchange completed, address: " + addr.String() + " doing topup...")
+
+	ctxTm, cancel = context.WithTimeout(context.Background(), 150*time.Second)
+	err = pmt.TopupChannel(ctxTm, addr, amt)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("failed to topup channel with node: %w", err)
+	}
+	log.Info().Msg("Channel topup completed: " + addr.String())
 
 	return ch, nil
 }

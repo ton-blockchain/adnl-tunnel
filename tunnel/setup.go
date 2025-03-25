@@ -167,7 +167,7 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	}
 
 	inv := make(chan any)
-	sc := chain.NewScanner(apiClient, payments.AsyncPaymentChannelCodeHash, seqno, logger)
+	sc := chain.NewScanner(apiClient, payments.PaymentChannelCodeHash, seqno, logger)
 	if err = sc.Start(context.Background(), inv); err != nil {
 		return nil, fmt.Errorf("failed to start chain scanner: %w", err)
 	}
@@ -237,7 +237,7 @@ func preparePayerPaymentChannel(ctx context.Context, pmt *tonpayments.Service, c
 
 	var inp string
 
-	// if no channels (or specified channel) are nod deployed, we deploy
+	// if no channels (or specified channel) are not deployed, we deploy
 	if len(ch) == 0 {
 		log.Info().Msg("No active onchain payment channel found, please input payment node id (pub key) in hex format, to deploy channel with:")
 		if _, err = fmt.Scanln(&inp); err != nil {
@@ -265,12 +265,34 @@ func preparePayerPaymentChannel(ctx context.Context, pmt *tonpayments.Service, c
 	}
 
 	ctxTm, cancel := context.WithTimeout(context.Background(), 150*time.Second)
-	addr, err := pmt.DeployChannelWithNode(ctxTm, amt, ch, nil)
+	addr, err := pmt.DeployChannelWithNode(ctxTm, ch, nil, 0)
 	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("failed to deploy channel with node: %w", err)
 	}
-	log.Info().Msg("Onchain channel deployed at address: " + addr.String())
+	log.Info().Msg("Onchain channel deployed at address: " + addr.String() + " waiting for states exchange...")
+
+	for {
+		channel, err := pmt.GetChannel(context.Background(), addr.String())
+		if err != nil {
+			return nil, fmt.Errorf("failed to get channel: %w", err)
+		}
+
+		if !channel.Our.IsReady() || !channel.Their.IsReady() {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		break
+	}
+	log.Info().Msg("Channel states exchange completed, address: " + addr.String() + " doing topup...")
+
+	ctxTm, cancel = context.WithTimeout(context.Background(), 150*time.Second)
+	err = pmt.TopupChannel(ctxTm, addr, amt)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("failed to topup channel with node: %w", err)
+	}
+	log.Info().Msg("Channel topup completed: " + addr.String())
 
 	return ch, nil
 }
