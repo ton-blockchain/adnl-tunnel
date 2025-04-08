@@ -394,6 +394,7 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 			}
 
 			if !sec.checkSeqno(m.Seqno) {
+				sec.log.Debug().Uint32("seqno", m.Seqno).Msg("repeating packet")
 				return fmt.Errorf("repeating packet")
 			}
 
@@ -440,6 +441,8 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 			}
 
 			if !sec.checkSeqno(m.Seqno) {
+				sec.log.Debug().Uint32("seqno", m.Seqno).Msg("repeating packet")
+
 				return fmt.Errorf("repeating packet")
 			}
 

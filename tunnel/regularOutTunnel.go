@@ -369,7 +369,7 @@ func (t *RegularOutTunnel) startSystemSender() {
 		if lastMsg == nil {
 			continue
 		}
-		lastMsg.Seqno = atomic.AndUint32(&t.seqnoForward, 1)
+		lastMsg.Seqno = atomic.AddUint32(&t.seqnoForward, 1)
 
 		for {
 			if err = t.peer.SendCustomMessage(context.Background(), lastMsg); err != nil {
@@ -457,7 +457,6 @@ func (t *RegularOutTunnel) buildTunnelPaymentsChain(paymentTunnel []PaymentTunne
 			Fee:      new(big.Int).Set(fees[i]),
 			Deadline: base.Add(time.Duration(n-i) * hopTTL),
 		}
-		println("DL", i, (time.Duration(n-i) * hopTTL).String())
 	}
 
 	return chain, nil

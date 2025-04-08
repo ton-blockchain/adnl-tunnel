@@ -73,7 +73,7 @@ func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, net
 		return nil, 0, nil, fmt.Errorf("failed to create DHT client: %w", err)
 	}
 
-	zLogger := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger().Level(zerolog.InfoLevel)
+	zLogger := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger().Level(log.Logger.GetLevel())
 
 	var pay *tonpayments.Service
 	if cfg.PaymentsEnabled {
@@ -174,20 +174,21 @@ func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, net
 }
 
 func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, dhtClient *dht.Client, cfg *config.ClientConfig, sharedCfg *config.SharedConfig, logger zerolog.Logger, manager adnl.NetManager) (*tonpayments.Service, error) {
-	nodePrv := ed25519.NewKeyFromSeed(cfg.Payments.PaymentsServerKey)
-	gate := adnl.NewGatewayWithNetManager(nodePrv, manager)
+	nodePrv := ed25519.NewKeyFromSeed(cfg.Payments.PaymentsNodeKey)
+	serverPrv := ed25519.NewKeyFromSeed(cfg.Payments.ADNLServerKey)
+	gate := adnl.NewGatewayWithNetManager(serverPrv, manager)
 
 	if err := gate.StartClient(); err != nil {
 		return nil, fmt.Errorf("failed to init adnl gateway: %w", err)
 	}
 
 	walletPrv := ed25519.NewKeyFromSeed(cfg.Payments.WalletPrivateKey)
-	fdb, err := leveldb.NewDB(cfg.Payments.DBPath, walletPrv.Public().(ed25519.PublicKey))
+	fdb, err := leveldb.NewDB(cfg.Payments.DBPath, nodePrv.Public().(ed25519.PublicKey))
 	if err != nil {
 		return nil, fmt.Errorf("failed to init leveldb: %w", err)
 	}
 
-	tr := transport.NewServer(dhtClient, gate, nodePrv, walletPrv, false)
+	tr := transport.NewServer(dhtClient, gate, serverPrv, nodePrv, false)
 
 	var seqno uint32
 	if bo, err := fdb.GetBlockOffset(ctx); err != nil {
@@ -229,13 +230,13 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	}
 	logger.Info().Msg("wallet initialized with address: " + w.WalletAddress().String())
 
-	svc, err := tonpayments.NewService(apiClient, fdb, tr, w, inv, walletPrv, cfg.Payments.ChannelsConfig)
+	svc, err := tonpayments.NewService(apiClient, fdb, tr, w, inv, nodePrv, cfg.Payments.ChannelsConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init tonpayments: %w", err)
 	}
 
 	tr.SetService(svc)
-	logger.Info().Msg("payment node initialized with public key: " + base64.StdEncoding.EncodeToString(walletPrv.Public().(ed25519.PublicKey)))
+	logger.Info().Msg("payment node initialized with public key: " + base64.StdEncoding.EncodeToString(nodePrv.Public().(ed25519.PublicKey)))
 
 	go svc.Start()
 
@@ -247,7 +248,6 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 
 		if sec.Payment != nil {
 			var jetton *address.Address
-			var jettonStr string
 			var key = base64.StdEncoding.EncodeToString(sec.Payment.Chain[0].NodeKey)
 			if sec.Payment.ExtraCurrencyID != 0 {
 				key += ", EC: " + fmt.Sprint(sec.Payment.ExtraCurrencyID)
@@ -255,7 +255,6 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 			if sec.Payment.JettonMaster != nil {
 				key += ", jetton: " + *sec.Payment.JettonMaster
 				jetton = address.MustParseAddr(*sec.Payment.JettonMaster)
-				jettonStr = jetton.Bounce(true).String()
 			}
 
 			if _, ok := requiredChannels[key]; !ok {
@@ -266,12 +265,7 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 
 			log.Info().Str("key", key).Msg("checking required channel for payment node...")
 
-			cc, err := svc.ResolveCoinConfig(jettonStr, sec.Payment.ExtraCurrencyID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to resolve coin config: %w", err)
-			}
-
-			if _, err = preparePayerPaymentChannel(ctx, svc, sec.Payment.Chain[0].NodeKey, int(cc.Decimals), jetton, sec.Payment.ExtraCurrencyID); err != nil {
+			if _, err = preparePayerPaymentChannel(ctx, svc, sec.Payment.Chain[0].NodeKey, jetton, sec.Payment.ExtraCurrencyID); err != nil {
 				return nil, fmt.Errorf("failed to prepare payment channel for %s: %w", key, err)
 			}
 		}
@@ -280,7 +274,7 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	return svc, nil
 }
 
-func preparePayerPaymentChannel(ctx context.Context, pmt *tonpayments.Service, ch []byte, decimals int, jetton *address.Address, ecID uint32) ([]byte, error) {
+func preparePayerPaymentChannel(ctx context.Context, pmt *tonpayments.Service, ch []byte, jetton *address.Address, ecID uint32) ([]byte, error) {
 	list, err := pmt.ListChannels(ctx, nil, db.ChannelStateActive)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list channels: %w", err)

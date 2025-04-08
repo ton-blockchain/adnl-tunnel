@@ -313,8 +313,9 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 		apiClient.SetTrustedBlockFromConfig(gCfg)
 	}
 
-	nodePrv := ed25519.NewKeyFromSeed(cfg.Payments.PaymentsServerKey)
-	gate := adnl.NewGateway(nodePrv)
+	nodePrv := ed25519.NewKeyFromSeed(cfg.Payments.PaymentsNodeKey)
+	serverPrv := ed25519.NewKeyFromSeed(cfg.Payments.ADNLServerKey)
+	gate := adnl.NewGateway(serverPrv)
 
 	if err := gate.StartClient(); err != nil {
 		log.Fatal().Err(err).Msg("failed to init adnl payments gateway")
@@ -322,13 +323,13 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 	}
 
 	walletPrv := ed25519.NewKeyFromSeed(cfg.Payments.WalletPrivateKey)
-	fdb, err := leveldb.NewDB(cfg.Payments.DBPath, walletPrv.Public().(ed25519.PublicKey))
+	fdb, err := leveldb.NewDB(cfg.Payments.DBPath, nodePrv.Public().(ed25519.PublicKey))
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to init leveldb")
 		return nil
 	}
 
-	tr := transport.NewServer(dhtClient, gate, nodePrv, walletPrv, cfg.ExternalIP != "")
+	tr := transport.NewServer(dhtClient, gate, serverPrv, nodePrv, cfg.ExternalIP != "")
 
 	var seqno uint32
 	if bo, err := fdb.GetBlockOffset(ctx); err != nil {
@@ -377,13 +378,13 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 	}
 	log.Info().Str("addr", w.WalletAddress().String()).Msg("wallet initialized")
 
-	svc, err := tonpayments.NewService(apiClient, fdb, tr, w, inv, walletPrv, cfg.Payments.ChannelsConfig)
+	svc, err := tonpayments.NewService(apiClient, fdb, tr, w, inv, nodePrv, cfg.Payments.ChannelsConfig)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to init payments service")
 		return nil
 	}
 	tr.SetService(svc)
-	log.Info().Hex("pubkey", walletPrv.Public().(ed25519.PublicKey)).Msg("node initialized")
+	log.Info().Str("pubkey", base64.StdEncoding.EncodeToString(nodePrv.Public().(ed25519.PublicKey))).Msg("node initialized")
 
 	return svc
 }

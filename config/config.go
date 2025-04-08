@@ -17,7 +17,8 @@ import (
 )
 
 type PaymentsConfig struct {
-	PaymentsServerKey []byte
+	ADNLServerKey     []byte
+	PaymentsNodeKey   []byte
 	WalletPrivateKey  []byte
 	DBPath            string
 	SecureProofPolicy bool
@@ -54,7 +55,8 @@ type TunnelSectionPayment struct {
 }
 
 type PaymentsClientConfig struct {
-	PaymentsServerKey []byte
+	ADNLServerKey     []byte
+	PaymentsNodeKey   []byte
 	WalletPrivateKey  []byte
 	DBPath            string
 	SecureProofPolicy bool
@@ -193,6 +195,11 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, err
 		}
 
+		_, adnlPrv, err := ed25519.GenerateKey(nil)
+		if err != nil {
+			return nil, err
+		}
+
 		_, tunnelPrv, err := ed25519.GenerateKey(nil)
 		if err != nil {
 			return nil, err
@@ -210,7 +217,8 @@ func LoadConfig(path string) (*Config, error) {
 			TunnelThreads:    uint(runtime.NumCPU()),
 			PaymentsEnabled:  false,
 			Payments: PaymentsConfig{
-				PaymentsServerKey: paymentsPrv.Seed(),
+				ADNLServerKey:     adnlPrv.Seed(),
+				PaymentsNodeKey:   paymentsPrv.Seed(),
 				WalletPrivateKey:  priv.Seed(),
 				DBPath:            "./payments-db/",
 				SecureProofPolicy: false,
@@ -300,6 +308,11 @@ func GenerateClientConfig(path string) (*ClientConfig, error) {
 		return nil, err
 	}
 
+	_, adnlPrv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return nil, err
+	}
+
 	_, tunnelPrv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		return nil, err
@@ -317,7 +330,8 @@ func GenerateClientConfig(path string) (*ClientConfig, error) {
 		SharedConfigPath:  "./tunnel-nodes-pool.json",
 		PaymentsEnabled:   false,
 		Payments: PaymentsClientConfig{
-			PaymentsServerKey: paymentsPrv.Seed(),
+			ADNLServerKey:     adnlPrv.Seed(),
+			PaymentsNodeKey:   paymentsPrv.Seed(),
 			WalletPrivateKey:  priv.Seed(),
 			DBPath:            "./payments-db/",
 			SecureProofPolicy: false,
@@ -376,7 +390,7 @@ func GenerateClientConfig(path string) (*ClientConfig, error) {
 func GenerateSharedConfig(src *Config, path string) (*SharedConfig, error) {
 	var pmt *TunnelSectionPayment
 	if src.PaymentsEnabled && (src.Payments.MinPricePerPacketInOut > 0 || src.Payments.MinPricePerPacketRoute > 0) {
-		ppk := ed25519.NewKeyFromSeed(src.Payments.PaymentsServerKey)
+		ppk := ed25519.NewKeyFromSeed(src.Payments.PaymentsNodeKey)
 		pmt = &TunnelSectionPayment{
 			Chain: []PaymentChain{
 				{
