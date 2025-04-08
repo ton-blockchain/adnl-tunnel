@@ -138,11 +138,15 @@ type CacheInstruction struct {
 
 // Parse implemented manually for optimization
 func (ins *CacheInstruction) Parse(data []byte) ([]byte, error) {
+	if len(data) < 16 {
+		return nil, fmt.Errorf("corrupted instruction, len %d", len(data))
+	}
+
 	ins.Version = binary.LittleEndian.Uint32(data)
 	ins.PayloadVerifyKey = binary.LittleEndian.Uint64(data[4:])
 
 	num := int(binary.LittleEndian.Uint32(data[12:]))
-	data = data[8:]
+	data = data[16:]
 
 	for i := 0; i < num; i++ {
 		if len(data) < 4 {

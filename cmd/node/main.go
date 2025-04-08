@@ -347,9 +347,20 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 
 	inv := make(chan any)
 	sc := chain.NewScanner(apiClient, payments.PaymentChannelCodeHash, seqno, scanLog)
-	if err = sc.Start(context.Background(), inv); err != nil {
-		log.Fatal().Err(err).Msg("failed to start chain scanner")
-		return nil
+	if err = sc.StartSmall(inv); err != nil {
+		log.Fatal().Err(err).Msg("failed to start scanner")
+	}
+	fdb.SetOnChannelUpdated(sc.OnChannelUpdate)
+
+	chList, err := fdb.GetChannels(context.Background(), nil, db.ChannelStateAny)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to load channels")
+	}
+
+	for _, channel := range chList {
+		if channel.Status != db.ChannelStateInactive {
+			sc.OnChannelUpdate(context.Background(), channel, true)
+		}
 	}
 
 	w, err := wallet.FromPrivateKey(apiClient, walletPrv, wallet.ConfigHighloadV3{
@@ -435,6 +446,10 @@ func preparePaymentChannel(ctx context.Context, pmt *tonpayments.Service, ch []b
 	for {
 		channel, err := pmt.GetChannel(context.Background(), addr.String())
 		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
 			return nil, fmt.Errorf("failed to get channel: %w", err)
 		}
 

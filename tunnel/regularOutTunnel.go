@@ -457,6 +457,7 @@ func (t *RegularOutTunnel) buildTunnelPaymentsChain(paymentTunnel []PaymentTunne
 			Fee:      new(big.Int).Set(fees[i]),
 			Deadline: base.Add(time.Duration(n-i) * hopTTL),
 		}
+		println("DL", i, (time.Duration(n-i) * hopTTL).String())
 	}
 
 	return chain, nil

@@ -161,6 +161,8 @@ func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, net
 		return nil, 0, nil, fmt.Errorf("create regular out tunnel failed: %w", err)
 	}
 
+	zLogger.Info().Msg("waiting adnl tunnel confirmation...")
+
 	extIP, extPort, err := tun.WaitForInit(context.Background())
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("wait for tunnel init failed: %w", err)
@@ -198,8 +200,20 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 
 	inv := make(chan any)
 	sc := chain.NewScanner(apiClient, payments.PaymentChannelCodeHash, seqno, logger)
-	if err = sc.Start(context.Background(), inv); err != nil {
-		return nil, fmt.Errorf("failed to start chain scanner: %w", err)
+	if err = sc.StartSmall(inv); err != nil {
+		return nil, fmt.Errorf("failed to start account scanner: %w", err)
+	}
+	fdb.SetOnChannelUpdated(sc.OnChannelUpdate)
+
+	chList, err := fdb.GetChannels(context.Background(), nil, db.ChannelStateAny)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load channels: %w", err)
+	}
+
+	for _, channel := range chList {
+		if channel.Status != db.ChannelStateInactive {
+			sc.OnChannelUpdate(context.Background(), channel, true)
+		}
 	}
 
 	w, err := wallet.FromPrivateKey(apiClient, walletPrv, wallet.ConfigHighloadV3{
@@ -290,6 +304,10 @@ func preparePayerPaymentChannel(ctx context.Context, pmt *tonpayments.Service, c
 	for {
 		channel, err := pmt.GetChannel(context.Background(), addr.String())
 		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
 			return nil, fmt.Errorf("failed to get channel: %w", err)
 		}
 

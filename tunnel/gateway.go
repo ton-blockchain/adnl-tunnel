@@ -427,10 +427,12 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 					cipherKeyCrc: crc64.Checksum(shKey, crcTable),
 					routes:       map[uint32]*Route{},
 					payments:     map[string]*PaymentChannel{},
+					lastPacketAt: time.Now().Unix(),
 					log: g.log.With().
 						Hex("tunnel", m.SectionPubKey).Logger(),
 					mx: sync.RWMutex{},
 				}
+				sec.log.Debug().Msg("inbound section created")
 
 				g.mx.Lock()
 				g.inboundSections[string(m.SectionPubKey)] = sec

@@ -5,7 +5,7 @@ go 1.23.3
 require (
 	github.com/kevinms/leakybucket-go v0.0.0-20200115003610-082473db97ca
 	github.com/rs/zerolog v1.33.0
-	github.com/xssnick/ton-payment-network v0.0.0-20250408111512-39ea004ae65d
+	github.com/xssnick/ton-payment-network v0.0.0-20250408124034-e3bcc10cead3
 	github.com/xssnick/tonutils-go v1.12.0
 )
 
