@@ -95,13 +95,23 @@ func PrepareTunnel(onRecv C.RecvCallback, onReinit C.ReinitCallback, nextOnRecv,
 		log.Fatal().Err(err).Msg("Failed to parse tunnel config")
 	}
 
+	data, err = os.ReadFile(cfg.SharedConfigPath)
+	if err != nil {
+		log.Fatal().Err(err).Str("path", cfg.SharedConfigPath).Msg("Failed to load tunnel shared config (nodes pool)")
+	}
+
+	var sharedCfg config.SharedConfig
+	if err = json.Unmarshal(data, &sharedCfg); err != nil {
+		log.Fatal().Err(err).Msg("Failed to parse tunnel shared config")
+	}
+
 	var netCfg liteclient.GlobalConfig
 	if err := json.Unmarshal(C.GoBytes(unsafe.Pointer(networkConfigJson), networkConfigJsonLen), &netCfg); err != nil {
 		log.Error().Err(err).Msg("failed to parse network config")
 		return C.Tunnel{}
 	}
 
-	tun, port, ip, err := tunnel.PrepareTunnel(&cfg, &netCfg)
+	tun, port, ip, err := tunnel.PrepareTunnel(&cfg, &sharedCfg, &netCfg)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to prepare tunnel")
 		return C.Tunnel{}

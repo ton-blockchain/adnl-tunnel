@@ -12,6 +12,7 @@ import (
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -38,13 +39,17 @@ type VirtualPaymentChannel struct {
 }
 
 type PaymentTunnelSection struct {
-	Key ed25519.PublicKey
-	Fee *big.Int
+	Key         ed25519.PublicKey
+	MinFee      *big.Int
+	PercentFee  *big.Float
+	MaxCapacity *big.Int
 }
 
 type Payer struct {
-	PaymentTunnel  []PaymentTunnelSection
-	PricePerPacket uint64
+	PaymentTunnel   []PaymentTunnelSection
+	PricePerPacket  uint64
+	JettonMaster    *address.Address
+	ExtraCurrencyID uint32
 
 	ActiveChannels []*VirtualPaymentChannel
 }
@@ -96,6 +101,8 @@ type RegularOutTunnel struct {
 	packetsPrepaidOut int64
 
 	lastFullyCheckedAt int64
+
+	seqnoForward uint32
 
 	wDeadline time.Time
 	rDeadline time.Time
@@ -362,6 +369,7 @@ func (t *RegularOutTunnel) startSystemSender() {
 		if lastMsg == nil {
 			continue
 		}
+		lastMsg.Seqno = atomic.AndUint32(&t.seqnoForward, 1)
 
 		for {
 			if err = t.peer.SendCustomMessage(context.Background(), lastMsg); err != nil {
@@ -381,22 +389,87 @@ func (t *RegularOutTunnel) startSystemSender() {
 	}
 }
 
-func (t *RegularOutTunnel) openVirtualChannel(p *Payer, capacity *big.Int) (*VirtualPaymentChannel, error) {
-	t.log.Debug().Uint64("price_per_packet", p.PricePerPacket).Str("capacity", tlb.FromNanoTON(capacity).String()).Msg("opening virtual channel")
-	fullAmt := new(big.Int).Set(capacity)
-	var tunChain = make([]transport.TunnelChainPart, len(p.PaymentTunnel))
-	var deadline = time.Now().Add(1 * time.Hour)
+func (t *RegularOutTunnel) buildTunnelPaymentsChain(paymentTunnel []PaymentTunnelSection, initialCapacity *big.Int, baseTTL, hopTTL time.Duration) ([]transport.TunnelChainPart, error) {
+	n := len(paymentTunnel)
 
-	for i := len(p.PaymentTunnel) - 1; i >= 0; i-- {
-		tunChain[i] = transport.TunnelChainPart{
-			Target:   p.PaymentTunnel[i].Key,
-			Capacity: new(big.Int).Set(fullAmt),
-			Fee:      p.PaymentTunnel[i].Fee,
-			Deadline: deadline,
+	if n == 0 {
+		return nil, errors.New("empty payment tunnel")
+	}
+
+	cumulativeFees := make([]*big.Int, n+1)
+	fees := make([]*big.Int, n)
+	for i := 0; i <= n; i++ {
+		cumulativeFees[i] = big.NewInt(0)
+	}
+
+	x := new(big.Int).Set(initialCapacity)
+	maxIter := 10
+
+	for iter := 0; iter < maxIter; iter++ {
+		cumulativeFees[n].SetInt64(0)
+		for i := n - 1; i >= 0; i-- {
+			R := new(big.Int).Add(x, cumulativeFees[i+1])
+			rFloat := new(big.Float).SetInt(R)
+			candidateFeeFloat := new(big.Float).Mul(paymentTunnel[i].PercentFee, rFloat)
+			candidateFeeFloat = candidateFeeFloat.Quo(candidateFeeFloat, new(big.Float).SetInt(big.NewInt(100)))
+			candidateFee := new(big.Int)
+
+			candidateFeeFloat.Int(candidateFee)
+			feeI := new(big.Int)
+			if candidateFee.Cmp(paymentTunnel[i].MinFee) > 0 {
+				feeI.Set(candidateFee)
+			} else {
+				feeI.Set(paymentTunnel[i].MinFee)
+			}
+			fees[i] = feeI
+			cumulativeFees[i] = new(big.Int).Add(feeI, cumulativeFees[i+1])
 		}
 
-		deadline = deadline.Add(30 * time.Minute)
-		fullAmt = fullAmt.Add(fullAmt, p.PaymentTunnel[i].Fee)
+		newX := new(big.Int).Set(initialCapacity)
+		for i := 0; i < n; i++ {
+			allowed := new(big.Int).Sub(paymentTunnel[i].MaxCapacity, cumulativeFees[i+1])
+			if allowed.Cmp(newX) < 0 {
+				newX.Set(allowed)
+			}
+		}
+
+		if newX.Cmp(x) == 0 {
+			break
+		}
+		x.Set(newX)
+	}
+
+	if x.Sign() < 0 {
+		return nil, errors.New("min capacity on the way cannot cover fees")
+	}
+
+	requiredCapacities := make([]*big.Int, n)
+	for i := 0; i < n; i++ {
+		requiredCapacities[i] = new(big.Int).Add(x, cumulativeFees[i+1])
+	}
+
+	chain := make([]transport.TunnelChainPart, n)
+	base := time.Now().Add(baseTTL)
+	for i := 0; i < n; i++ {
+		chain[i] = transport.TunnelChainPart{
+			Target:   paymentTunnel[i].Key,
+			Capacity: new(big.Int).Set(requiredCapacities[i]),
+			Fee:      new(big.Int).Set(fees[i]),
+			Deadline: base.Add(time.Duration(n-i) * hopTTL),
+		}
+	}
+
+	return chain, nil
+}
+
+func (t *RegularOutTunnel) openVirtualChannel(p *Payer, capacity *big.Int) (*VirtualPaymentChannel, error) {
+	t.log.Debug().Uint64("price_per_packet", p.PricePerPacket).Str("capacity", tlb.FromNanoTON(capacity).String()).Msg("opening virtual channel")
+	var tunChain = make([]transport.TunnelChainPart, len(p.PaymentTunnel))
+	hopTTL := t.gateway.payments.Service.GetMinSafeTTL()
+
+	tunChain, err := t.buildTunnelPaymentsChain(p.PaymentTunnel, capacity, 1*time.Hour, hopTTL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build tunnel payments chain: %w", err)
 	}
 
 	_, chKey, err := ed25519.GenerateKey(nil)
@@ -409,7 +482,7 @@ func (t *RegularOutTunnel) openVirtualChannel(p *Payer, capacity *big.Int) (*Vir
 		return nil, fmt.Errorf("failed to generate tunnel: %w", err)
 	}
 
-	err = t.gateway.payments.Service.OpenVirtualChannel(context.Background(), tunChain[0].Target, firstInstructionKey, chKey, tun, vc)
+	err = t.gateway.payments.Service.OpenVirtualChannel(context.Background(), tunChain[0].Target, firstInstructionKey, tunChain[len(tunChain)-1].Target, chKey, tun, vc, p.JettonMaster, p.ExtraCurrencyID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open virtual channel: %w", err)
 	}
@@ -552,16 +625,17 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 
 				chIndex := 0
 				for amtLeft := new(big.Int).Mul(toPrepay, new(big.Int).SetUint64(p.PricePerPacket)); amtLeft.Sign() > 0; {
-					if chIndex >= 3 {
+					if chIndex >= 5 {
 						// TODO: not like this, maybe one bigger channel
 						return nil, fmt.Errorf("too many payment channels consumed for single payment")
 					}
 
 					if len(p.ActiveChannels) <= chIndex {
-						// make capacity enough for ChannelCapacityForNumPayments payments
-						amtCap := new(big.Int).Mul(regularAmount, big.NewInt(ChannelCapacityForNumPayments))
+						// make capacity enough for ChannelCapacityForNumPayments payments,
+						// but in fact it can be less if intermediate nodes not allow this amount
+						wantCap := new(big.Int).Mul(regularAmount, big.NewInt(ChannelCapacityForNumPayments))
 
-						vc, err := t.openVirtualChannel(p, amtCap)
+						vc, err := t.openVirtualChannel(p, wantCap)
 						if err != nil {
 							return nil, fmt.Errorf("open virtual channel failed: %w", err)
 						}
@@ -954,11 +1028,13 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if t.tunnelState >= StateTypeOptimized {
 		msg = &EncryptedMessageCached{
 			SectionPubKey: t.chainTo[0].Keys.SectionPubKey,
+			Seqno:         atomic.AddUint32(&t.seqnoForward, 1),
 			Payload:       payload,
 		}
 	} else {
 		msg = &EncryptedMessage{
 			SectionPubKey: t.chainTo[0].Keys.SectionPubKey,
+			Seqno:         atomic.AddUint32(&t.seqnoForward, 1),
 			Instructions:  t.currentSendInstructions,
 			Payload:       payload,
 		}

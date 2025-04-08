@@ -80,6 +80,8 @@ type Out struct {
 
 	PricePerPacket *big.Int
 
+	backSeqno uint32
+
 	mx  sync.RWMutex
 	log zerolog.Logger
 }
@@ -90,6 +92,7 @@ const (
 )
 
 type PaymentChannel struct {
+	Key         ed25519.PublicKey
 	Active      bool
 	Deadline    int64
 	Capacity    *big.Int
@@ -114,6 +117,10 @@ type Section struct {
 	cachedActionsVer uint32
 
 	payments map[string]*PaymentChannel
+
+	lastSeqno   uint32
+	seqnoWindow [8]uint64 // 512
+	seqnoMx     sync.Mutex
 
 	log zerolog.Logger
 	mx  sync.RWMutex
@@ -156,6 +163,7 @@ type Gateway struct {
 type EncryptedMessage struct {
 	// used to generate shared key for decryption
 	SectionPubKey []byte `tl:"int256"`
+	Seqno         uint32 `tl:"int"`
 
 	// instructions are recursively encrypted, each receiver decrypts its own layer
 	Instructions []byte `tl:"bytes"`
@@ -164,12 +172,13 @@ type EncryptedMessage struct {
 	// just once, only some instructions use payload.
 	// payload can contain multiple payloads
 	Payload []byte `tl:"bytes"`
-} // min overhead size: 60 bytes
+} // min overhead size: 64 bytes
 
 type EncryptedMessageCached struct {
 	SectionPubKey []byte `tl:"int256"`
+	Seqno         uint32 `tl:"int"`
 	Payload       []byte `tl:"bytes"`
-} // overhead size: 36 bytes
+} // overhead size: 40 bytes
 
 type PaymentConfig struct {
 	Service                *tonpayments.Service
@@ -332,11 +341,18 @@ func (g *Gateway) keepAlivePeersAndSections() {
 			}
 
 			var sectionsToClose []*Section
+			var paymentsToClose []*PaymentChannel
 
 			g.mx.RLock()
 			for _, section := range g.inboundSections {
 				if atomic.LoadInt64(&section.lastPacketAt) < tm-SectionMaxInactiveSec {
 					sectionsToClose = append(sectionsToClose, section)
+				} else {
+					for _, channel := range section.payments {
+						if channel.Active && channel.Deadline < tm {
+							paymentsToClose = append(paymentsToClose, channel)
+						}
+					}
 				}
 			}
 			g.mx.RUnlock()
@@ -347,6 +363,10 @@ func (g *Gateway) keepAlivePeersAndSections() {
 					delete(g.inboundSections, string(section.key))
 					g.mx.Unlock()
 				}
+			}
+
+			for _, channel := range paymentsToClose {
+				_ = g.closePaymentChannel(channel)
 			}
 		}
 	}
@@ -373,13 +393,17 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 				return fmt.Errorf("section is not exists")
 			}
 
+			if !sec.checkSeqno(m.Seqno) {
+				return fmt.Errorf("repeating packet")
+			}
+
 			if len(sec.cachedActions) == 0 {
 				return fmt.Errorf("cache is empty")
 			}
 
 			atomic.StoreInt64(&sec.lastPacketAt, time.Now().Unix())
 			for i, inst := range sec.cachedActions {
-				if err := inst.Execute(g.closerCtx, sec, m.Payload); err != nil {
+				if err := inst.Execute(g.closerCtx, sec, &m); err != nil {
 					sec.log.Debug().Type("instruction", inst).Err(err).Msg("execute cached instruction failed")
 					return fmt.Errorf("execute cached action %d error: %w", i, err)
 				}
@@ -411,6 +435,10 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 				g.mx.Lock()
 				g.inboundSections[string(m.SectionPubKey)] = sec
 				g.mx.Unlock()
+			}
+
+			if !sec.checkSeqno(m.Seqno) {
+				return fmt.Errorf("repeating packet")
 			}
 
 			container, restInstructions, err := sec.decryptMessage(&m)
@@ -549,26 +577,31 @@ func decryptStream(cipherKeyCrc uint64, cipherKey, data []byte) ([]byte, error) 
 	return pl, nil
 }
 
+func (g *Gateway) closePaymentChannel(ch *PaymentChannel) error {
+	ch.mx.Lock()
+	defer ch.mx.Unlock()
+
+	// we mark it as inactive in any way, because it is complicated to handle closure errors and they are very unlikely
+	ch.Active = false
+
+	if !ch.Active || ch.LatestState == nil {
+		return nil
+	}
+
+	if err := g.payments.Service.CloseVirtualChannel(context.Background(), ch.Key); err != nil {
+		g.log.Warn().Err(err).Hex("key", ch.Key).Msg("failed to close virtual payment channel")
+	}
+	return nil
+}
+
 func (s *Section) closeIfNotLocked() bool {
 	if !s.mx.TryLock() {
 		return false
 	}
 	defer s.mx.Unlock()
 
-	for key, ch := range s.payments {
-		ch.mx.Lock()
-
-		if !ch.Active || ch.LatestState == nil {
-			ch.mx.Unlock()
-			continue
-		}
-
-		if err := s.gw.payments.Service.CloseVirtualChannel(context.Background(), []byte(key)); err != nil {
-			ch.mx.Unlock()
-			s.log.Warn().Err(err).Hex("key", []byte(key)).Msg("failed to close virtual payment channel")
-			continue
-		}
-		ch.mx.Unlock()
+	for _, ch := range s.payments {
+		_ = s.gw.closePaymentChannel(ch)
 	}
 
 	if s.out != nil {

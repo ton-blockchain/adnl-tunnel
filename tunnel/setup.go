@@ -5,7 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
-	"encoding/hex"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"github.com/rs/zerolog"
@@ -14,10 +14,10 @@ import (
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain"
-	configPayments "github.com/xssnick/ton-payment-network/tonpayments/config"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/db/leveldb"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/liteclient"
@@ -25,11 +25,22 @@ import (
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/ton/wallet"
 	"math/big"
+	"math/rand"
 	"net"
 	"time"
+
+	cRand "crypto/rand"
 )
 
-func PrepareTunnel(cfg *config.ClientConfig, netCfg *liteclient.GlobalConfig) (*RegularOutTunnel, uint16, net.IP, error) {
+func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, netCfg *liteclient.GlobalConfig) (*RegularOutTunnel, uint16, net.IP, error) {
+	if len(sharedCfg.NodesPool) == 0 {
+		return nil, 0, nil, fmt.Errorf("no nodes pool provided, please specify at least one node in config file")
+	}
+
+	if uint(len(sharedCfg.NodesPool)) < cfg.TunnelSectionsNum {
+		return nil, 0, nil, fmt.Errorf("not enough nodes in pool to have desired tunnel sections number")
+	}
+
 	_, dhtKey, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("failed to generate DHT key: %w", err)
@@ -62,41 +73,6 @@ func PrepareTunnel(cfg *config.ClientConfig, netCfg *liteclient.GlobalConfig) (*
 		return nil, 0, nil, fmt.Errorf("failed to create DHT client: %w", err)
 	}
 
-	var chainTo, chainFrom []*SectionInfo
-
-	for i, s := range cfg.RouteOut {
-		si, err := paymentConfigToSections(&s, cfg.PaymentsEnabled)
-		if err != nil {
-			return nil, 0, nil, fmt.Errorf("convert config to section %d in `out` route failed: %w", i, err)
-		}
-
-		chainTo = append(chainTo, si)
-	}
-
-	for i, s := range cfg.RouteIn {
-		si, err := paymentConfigToSections(&s, cfg.PaymentsEnabled)
-		if err != nil {
-			return nil, 0, nil, fmt.Errorf("convert config to section %d in `in` route failed: %w", i, err)
-		}
-
-		chainFrom = append(chainFrom, si)
-	}
-
-	siGate, err := paymentConfigToSections(&cfg.OutGateway, cfg.PaymentsEnabled)
-	if err != nil {
-		return nil, 0, nil, fmt.Errorf("convert config to section out gateway failed: %w", err)
-	}
-
-	chainTo = append(chainTo, siGate)
-
-	toUs, err := GenerateEncryptionKeys(tunKey.Public().(ed25519.PublicKey))
-	if err != nil {
-		return nil, 0, nil, fmt.Errorf("generate us encryption keys failed: %w", err)
-	}
-	chainFrom = append(chainFrom, &SectionInfo{
-		Keys: toUs,
-	})
-
 	zLogger := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger().Level(zerolog.InfoLevel)
 
 	var pay *tonpayments.Service
@@ -108,7 +84,7 @@ func PrepareTunnel(cfg *config.ClientConfig, netCfg *liteclient.GlobalConfig) (*
 
 		apiClient := ton.NewAPIClient(lsClient, ton.ProofCheckPolicyFast).WithRetry().WithTimeout(10 * time.Second)
 
-		pay, err = preparePayerPayments(context.Background(), apiClient, dhtClient, cfg, zLogger, ml)
+		pay, err = preparePayerPayments(context.Background(), apiClient, dhtClient, cfg, sharedCfg, zLogger, ml)
 		if err != nil {
 			return nil, 0, nil, fmt.Errorf("prepare payments failed: %w", err)
 		}
@@ -126,6 +102,60 @@ func PrepareTunnel(cfg *config.ClientConfig, netCfg *liteclient.GlobalConfig) (*
 
 	zLogger.Info().Msg("initializing adnl tunnel...")
 
+	var chainTo, chainFrom []*SectionInfo
+
+	var rndInt = make([]byte, 8)
+	if _, err = cRand.Read(rndInt); err != nil {
+		return nil, 0, nil, fmt.Errorf("failed to generate random number: %w", err)
+	}
+	rnd := rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(rndInt))))
+
+	rnd.Shuffle(len(sharedCfg.NodesPool), func(i, j int) {
+		sharedCfg.NodesPool[i], sharedCfg.NodesPool[j] = sharedCfg.NodesPool[j], sharedCfg.NodesPool[i]
+	})
+
+	out := sharedCfg.NodesPool[0]
+	pool := sharedCfg.NodesPool[1:]
+
+	if cfg.TunnelSectionsNum > 1 {
+		for i := uint(0); i < cfg.TunnelSectionsNum-1; i++ {
+			si, err := paymentConfigToSections(&pool[i], false, pay)
+			if err != nil {
+				return nil, 0, nil, fmt.Errorf("convert config to section %d in `out` route failed: %w", i, err)
+			}
+
+			chainTo = append(chainTo, si)
+		}
+
+		rnd.Shuffle(len(pool), func(i, j int) {
+			pool[i], pool[j] = pool[j], pool[i]
+		})
+
+		for i := uint(0); i < cfg.TunnelSectionsNum-1; i++ {
+			si, err := paymentConfigToSections(&pool[i], false, pay)
+			if err != nil {
+				return nil, 0, nil, fmt.Errorf("convert config to section %d in `in` route failed: %w", i, err)
+			}
+
+			chainFrom = append(chainFrom, si)
+		}
+	}
+
+	siGate, err := paymentConfigToSections(&out, true, pay)
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("convert config to section out gateway failed: %w", err)
+	}
+
+	chainTo = append(chainTo, siGate)
+
+	toUs, err := GenerateEncryptionKeys(tunKey.Public().(ed25519.PublicKey))
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("generate us encryption keys failed: %w", err)
+	}
+	chainFrom = append(chainFrom, &SectionInfo{
+		Keys: toUs,
+	})
+
 	tun, err := tGate.CreateRegularOutTunnel(context.Background(), chainTo, chainFrom, zLogger.With().Str("component", "tunnel").Logger())
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("create regular out tunnel failed: %w", err)
@@ -141,7 +171,7 @@ func PrepareTunnel(cfg *config.ClientConfig, netCfg *liteclient.GlobalConfig) (*
 	return tun, extPort, extIP, nil
 }
 
-func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, dhtClient *dht.Client, cfg *config.ClientConfig, logger zerolog.Logger, manager adnl.NetManager) (*tonpayments.Service, error) {
+func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, dhtClient *dht.Client, cfg *config.ClientConfig, sharedCfg *config.SharedConfig, logger zerolog.Logger, manager adnl.NetManager) (*tonpayments.Service, error) {
 	nodePrv := ed25519.NewKeyFromSeed(cfg.Payments.PaymentsServerKey)
 	gate := adnl.NewGatewayWithNetManager(nodePrv, manager)
 
@@ -185,87 +215,72 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	}
 	logger.Info().Msg("wallet initialized with address: " + w.WalletAddress().String())
 
-	svc := tonpayments.NewService(apiClient, fdb, tr, w, inv, walletPrv, configPayments.ChannelConfig(cfg.Payments.ChannelConfig))
+	svc, err := tonpayments.NewService(apiClient, fdb, tr, w, inv, walletPrv, cfg.Payments.ChannelsConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init tonpayments: %w", err)
+	}
+
 	tr.SetService(svc)
 	logger.Info().Msg("payment node initialized with public key: " + base64.StdEncoding.EncodeToString(walletPrv.Public().(ed25519.PublicKey)))
 
 	go svc.Start()
-	if _, err = preparePayerPaymentChannel(ctx, svc, nil); err != nil {
-		return nil, fmt.Errorf("failed to prepare payment channel: %w", err)
+
+	var requiredChannels = map[string]bool{}
+	for _, sec := range sharedCfg.NodesPool {
+		if len(sec.Payment.Chain) == 0 {
+			return nil, fmt.Errorf("no payment nodes chain specified in config for node " + base64.StdEncoding.EncodeToString(sec.Key))
+		}
+
+		if sec.Payment != nil {
+			var jetton *address.Address
+			var jettonStr string
+			var key = base64.StdEncoding.EncodeToString(sec.Payment.Chain[0].NodeKey)
+			if sec.Payment.ExtraCurrencyID != 0 {
+				key += ", EC: " + fmt.Sprint(sec.Payment.ExtraCurrencyID)
+			}
+			if sec.Payment.JettonMaster != nil {
+				key += ", jetton: " + *sec.Payment.JettonMaster
+				jetton = address.MustParseAddr(*sec.Payment.JettonMaster)
+				jettonStr = jetton.Bounce(true).String()
+			}
+
+			if _, ok := requiredChannels[key]; !ok {
+				requiredChannels[key] = true
+			} else {
+				continue
+			}
+
+			log.Info().Str("key", key).Msg("checking required channel for payment node...")
+
+			cc, err := svc.ResolveCoinConfig(jettonStr, sec.Payment.ExtraCurrencyID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve coin config: %w", err)
+			}
+
+			if _, err = preparePayerPaymentChannel(ctx, svc, sec.Payment.Chain[0].NodeKey, int(cc.Decimals), jetton, sec.Payment.ExtraCurrencyID); err != nil {
+				return nil, fmt.Errorf("failed to prepare payment channel for %s: %w", key, err)
+			}
+		}
 	}
 
 	return svc, nil
 }
 
-func preparePayerPaymentChannel(ctx context.Context, pmt *tonpayments.Service, ch []byte) ([]byte, error) {
+func preparePayerPaymentChannel(ctx context.Context, pmt *tonpayments.Service, ch []byte, decimals int, jetton *address.Address, ecID uint32) ([]byte, error) {
 	list, err := pmt.ListChannels(ctx, nil, db.ChannelStateActive)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list channels: %w", err)
 	}
 
-	var best []byte
-	var bestAmount = big.NewInt(0)
 	for _, channel := range list {
-		if len(ch) > 0 {
-			if bytes.Equal(channel.TheirOnchain.Key, ch) {
-				// we have specified channel already deployed
-				return channel.TheirOnchain.Key, nil
-			}
-			continue
+		if bytes.Equal(channel.TheirOnchain.Key, ch) {
+			// we have specified channel already deployed
+			return channel.TheirOnchain.Key, nil
 		}
-
-		balance, err := channel.CalcBalance(false)
-		if err != nil {
-			continue
-		}
-
-		if balance.Cmp(tlb.MustFromTON("0.1").Nano()) < 0 {
-			// skip if balance too low
-			continue
-		}
-
-		// if specific channel not defined we select the channel with the biggest deposit
-		if balance.Cmp(bestAmount) >= 0 {
-			bestAmount = balance
-			best = channel.TheirOnchain.Key
-		}
-	}
-
-	if best != nil {
-		return best, nil
-	}
-
-	var inp string
-
-	// if no channels (or specified channel) are not deployed, we deploy
-	if len(ch) == 0 {
-		log.Info().Msg("No active onchain payment channel found, please input payment node id (pub key) in hex format, to deploy channel with:")
-		if _, err = fmt.Scanln(&inp); err != nil {
-			return nil, fmt.Errorf("failed to read input: %w", err)
-		}
-
-		ch, err = hex.DecodeString(inp)
-		if err != nil {
-			return nil, fmt.Errorf("invalid id formet: %w", err)
-		}
-	}
-
-	if len(ch) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("invalid channel id length")
-	}
-
-	log.Info().Msg("Please input amount in TON to reserve in channel:")
-	if _, err = fmt.Scanln(&inp); err != nil {
-		return nil, fmt.Errorf("failed to read input: %w", err)
-	}
-
-	amt, err := tlb.FromTON(inp)
-	if err != nil {
-		return nil, fmt.Errorf("incorrect format of amount: %w", err)
 	}
 
 	ctxTm, cancel := context.WithTimeout(context.Background(), 150*time.Second)
-	addr, err := pmt.DeployChannelWithNode(ctxTm, ch, nil, 0)
+	addr, err := pmt.DeployChannelWithNode(ctxTm, ch, jetton, ecID)
 	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("failed to deploy channel with node: %w", err)
@@ -284,20 +299,12 @@ func preparePayerPaymentChannel(ctx context.Context, pmt *tonpayments.Service, c
 		}
 		break
 	}
-	log.Info().Msg("Channel states exchange completed, address: " + addr.String() + " doing topup...")
-
-	ctxTm, cancel = context.WithTimeout(context.Background(), 150*time.Second)
-	err = pmt.TopupChannel(ctxTm, addr, amt)
-	cancel()
-	if err != nil {
-		return nil, fmt.Errorf("failed to topup channel with node: %w", err)
-	}
-	log.Info().Msg("Channel topup completed: " + addr.String())
+	log.Info().Str("address", addr.String()).Msg("Channel states exchange completed")
 
 	return ch, nil
 }
 
-func paymentConfigToSections(s *config.TunnelRouteSection, paymentsEnabled bool) (*SectionInfo, error) {
+func paymentConfigToSections(s *config.TunnelRouteSection, isOut bool, pay *tonpayments.Service) (*SectionInfo, error) {
 	if len(s.Key) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("invalid `in` route node key size")
 	}
@@ -308,28 +315,56 @@ func paymentConfigToSections(s *config.TunnelRouteSection, paymentsEnabled bool)
 	}
 
 	var payer *Payer
-	if s.Payment != nil && paymentsEnabled {
+	if s.Payment != nil && pay != nil {
 		var ptn []PaymentTunnelSection
+
+		var jetton *address.Address
+		var jettonStr string
+		if s.Payment.JettonMaster != nil {
+			if jetton, err = address.ParseAddr(*s.Payment.JettonMaster); err != nil {
+				return nil, fmt.Errorf("invalid jetton master address: %w", err)
+			}
+			jettonStr = jetton.Bounce(true).String()
+		}
+
+		cc, err := pay.ResolveCoinConfig(jettonStr, s.Payment.ExtraCurrencyID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve coin config: %w", err)
+		}
 
 		for _, paymentChain := range s.Payment.Chain {
 			if len(paymentChain.NodeKey) != ed25519.PublicKeySize {
 				return nil, fmt.Errorf("invalid payment node key size")
 			}
 
-			cFee, err := tlb.FromTON(paymentChain.FeePerVirtualChannel)
+			minFee, err := tlb.FromDecimal(paymentChain.MinFeePerVirtualChannel, int(cc.Decimals))
 			if err != nil {
 				return nil, fmt.Errorf("invalid payment fee: %w", err)
 			}
 
+			maxCap, err := tlb.FromDecimal(paymentChain.MaxCapacityPerVirtualChannel, int(cc.Decimals))
+			if err != nil {
+				return nil, fmt.Errorf("invalid payment cap: %w", err)
+			}
+
 			ptn = append(ptn, PaymentTunnelSection{
-				Key: paymentChain.NodeKey,
-				Fee: cFee.Nano(),
+				Key:         paymentChain.NodeKey,
+				MinFee:      minFee.Nano(),
+				PercentFee:  big.NewFloat(paymentChain.PercentFeePerVirtualChannel),
+				MaxCapacity: maxCap.Nano(),
 			})
 		}
 
+		price := s.Payment.PricePerPacketRouteNano
+		if isOut {
+			price = s.Payment.PricePerPacketOutNano
+		}
+
 		payer = &Payer{
-			PaymentTunnel:  ptn,
-			PricePerPacket: s.Payment.PricePerPacketNano,
+			PaymentTunnel:   ptn,
+			PricePerPacket:  price,
+			JettonMaster:    jetton,
+			ExtraCurrencyID: s.Payment.ExtraCurrencyID,
 		}
 	}
 

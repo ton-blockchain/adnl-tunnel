@@ -92,3 +92,80 @@ func TestGateway_encryptMessage(t1 *testing.T) {
 
 	println(c3.Rand, reflect.TypeOf(c3.List[0]).String())
 }
+
+func TestCheckSeqno(t *testing.T) {
+	var s Section
+
+	// Test 1: The first sequence number should be accepted.
+	if !s.checkSeqno(1000) {
+		t.Error("Expected to accept seqno 1000 as the first number")
+	}
+
+	// Test 2: Repeating the same number should return false.
+	if s.checkSeqno(1000) {
+		t.Error("Expected to reject duplicate seqno 1000")
+	}
+
+	// Test 3: A sequential number greater than the previous one.
+	if !s.checkSeqno(1001) {
+		t.Error("Expected to accept seqno 1001")
+	}
+
+	// Test 4: Repeating an already received older number (1000) should return false.
+	if s.checkSeqno(1000) {
+		t.Error("Expected to reject duplicate seqno 1000 (already received)")
+	}
+
+	// Test 5: Receiving an older number that has not been marked.
+	// With 100 and 101 received, seqno 99 (diff = 2) is not yet marked, so it should be accepted.
+	if !s.checkSeqno(999) {
+		t.Error("Expected to accept seqno 999 (not yet received)")
+	}
+
+	// Test 6: Number outside the window.
+	// With current lastSeqno == 101, seqno 37 (diff = 64) is outside the window.
+	if s.checkSeqno(37) {
+		t.Error("Expected to reject seqno 37 as it is outside the window")
+	}
+
+	// Test 7: Large jump forward.
+	// When transitioning from 101 to 200, the window is reset.
+	if !s.checkSeqno(2000) {
+		t.Error("Expected to accept seqno 2000 (new number, window reset)")
+	}
+	// Repeating seqno 200 should return false.
+	if s.checkSeqno(2000) {
+		t.Error("Expected to reject duplicate seqno 2000")
+	}
+
+	// Test 8: Receiving numbers in increasing order and checking for duplicates.
+	if !s.checkSeqno(2001) {
+		t.Error("Expected to accept seqno 2001")
+	}
+	if !s.checkSeqno(2002) {
+		t.Error("Expected to accept seqno 2002")
+	}
+	// Repeating seqno 201 should return false.
+	if s.checkSeqno(2001) {
+		t.Error("Expected to reject duplicate seqno 201")
+	}
+
+	// Test 9: Handling uint32 overflow.
+	// Simulate a situation where lastSeqno is near the maximum value.
+	s = Section{
+		lastSeqno:   0xFFFFFFF0,
+		seqnoWindow: [8]uint64{1 << 63, 0, 0, 0, 0, 0, 0, 0},
+	}
+	// In case of overflow, a new small seqno (e.g., 10) should be accepted.
+	if !s.checkSeqno(10) {
+		t.Error("Expected to accept seqno 10 during uint32 overflow")
+	}
+}
+
+func BenchmarkSeqnoCheck(b *testing.B) {
+	var s Section
+
+	for i := 0; i < b.N; i++ {
+		s.checkSeqno(uint32(i) - uint32(i)%5)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/rs/zerolog/log"
+	configPayments "github.com/xssnick/ton-payment-network/tonpayments/config"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,19 +16,12 @@ import (
 	"time"
 )
 
-type ChannelConfig struct {
-	VirtualChannelProxyFee      string
-	QuarantineDurationSec       uint32
-	MisbehaviorFine             string
-	ConditionalCloseDurationSec uint32
-}
-
 type PaymentsConfig struct {
 	PaymentsServerKey []byte
 	WalletPrivateKey  []byte
 	DBPath            string
 	SecureProofPolicy bool
-	ChannelConfig     ChannelConfig
+	ChannelsConfig    configPayments.ChannelsConfig
 
 	MinPricePerPacketRoute uint64
 	MinPricePerPacketInOut uint64
@@ -44,13 +38,37 @@ type Config struct {
 }
 
 type PaymentChain struct {
-	NodeKey              []byte
-	FeePerVirtualChannel string
+	NodeKey []byte
+
+	MaxCapacityPerVirtualChannel string
+	PercentFeePerVirtualChannel  float64
+	MinFeePerVirtualChannel      string
 }
 
 type TunnelSectionPayment struct {
-	Chain              []PaymentChain
-	PricePerPacketNano uint64
+	Chain                   []PaymentChain
+	JettonMaster            *string `json:",omitempty"`
+	ExtraCurrencyID         uint32  `json:",omitempty"`
+	PricePerPacketRouteNano uint64
+	PricePerPacketOutNano   uint64
+}
+
+type PaymentsClientConfig struct {
+	PaymentsServerKey []byte
+	WalletPrivateKey  []byte
+	DBPath            string
+	SecureProofPolicy bool
+	ChannelsConfig    configPayments.ChannelsConfig
+}
+
+type ClientConfig struct {
+	TunnelServerKey   []byte
+	TunnelThreads     uint
+	TunnelSectionsNum uint
+	SharedConfigPath  string
+
+	PaymentsEnabled bool
+	Payments        PaymentsClientConfig
 }
 
 type TunnelRouteSection struct {
@@ -58,14 +76,9 @@ type TunnelRouteSection struct {
 	Payment *TunnelSectionPayment
 }
 
-type ClientConfig struct {
-	TunnelServerKey []byte
-	TunnelThreads   uint
-	PaymentsEnabled bool
-	Payments        PaymentsConfig
-	OutGateway      TunnelRouteSection
-	RouteOut        []TunnelRouteSection
-	RouteIn         []TunnelRouteSection
+// SharedConfig is used as nodes pool to build a route
+type SharedConfig struct {
+	NodesPool []TunnelRouteSection
 }
 
 func checkIPAddress(ip string) string {
@@ -201,11 +214,52 @@ func LoadConfig(path string) (*Config, error) {
 				WalletPrivateKey:  priv.Seed(),
 				DBPath:            "./payments-db/",
 				SecureProofPolicy: false,
-				ChannelConfig: ChannelConfig{
-					VirtualChannelProxyFee:      "0.0001",
-					QuarantineDurationSec:       600,
-					MisbehaviorFine:             "0.15",
-					ConditionalCloseDurationSec: 180,
+				ChannelsConfig: configPayments.ChannelsConfig{
+					SupportedCoins: configPayments.CoinTypes{
+						Ton: configPayments.CoinConfig{
+							Enabled: true,
+							VirtualTunnelConfig: configPayments.VirtualConfig{
+								ProxyMaxCapacity: "0",
+								ProxyMinFee:      "0",
+								ProxyFeePercent:  0,
+								AllowTunneling:   false,
+							},
+							BalanceControl: &configPayments.BalanceControlConfig{
+								DepositWhenAmountLessThan: "0",
+								DepositUpToAmount:         "0",
+								WithdrawWhenAmountReached: "5",
+							},
+							MisbehaviorFine: "3",
+							ExcessFeeTon:    "0.25",
+							Symbol:          "TON",
+							Decimals:        9,
+						},
+						Jettons: map[string]configPayments.CoinConfig{
+							"EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs": {
+								Enabled: false,
+								VirtualTunnelConfig: configPayments.VirtualConfig{
+									ProxyMaxCapacity: "0",
+									ProxyMinFee:      "0",
+									ProxyFeePercent:  0,
+									AllowTunneling:   false,
+								},
+								BalanceControl: &configPayments.BalanceControlConfig{
+									DepositWhenAmountLessThan: "0",
+									DepositUpToAmount:         "0",
+									WithdrawWhenAmountReached: "15",
+								},
+								MisbehaviorFine: "12",
+								ExcessFeeTon:    "0.35",
+								Symbol:          "USDT",
+								Decimals:        6,
+							},
+						},
+						ExtraCurrencies: map[uint32]configPayments.CoinConfig{},
+					},
+					BufferTimeToCommit:              3 * 3600,
+					QuarantineDurationSec:           6 * 3600,
+					ConditionalCloseDurationSec:     3 * 3600,
+					MinSafeVirtualChannelTimeoutSec: 300,
 				},
 			},
 		}
@@ -256,47 +310,96 @@ func GenerateClientConfig(path string) (*ClientConfig, error) {
 		return nil, err
 	}
 
-	tmp := make([]byte, 32)
-
 	cfg := &ClientConfig{
-		TunnelServerKey: tunnelPrv.Seed(),
-		TunnelThreads:   uint(runtime.NumCPU()),
-		PaymentsEnabled: false,
-		Payments: PaymentsConfig{
+		TunnelServerKey:   tunnelPrv.Seed(),
+		TunnelThreads:     uint(runtime.NumCPU()),
+		TunnelSectionsNum: 1,
+		SharedConfigPath:  "./tunnel-nodes-pool.json",
+		PaymentsEnabled:   false,
+		Payments: PaymentsClientConfig{
 			PaymentsServerKey: paymentsPrv.Seed(),
 			WalletPrivateKey:  priv.Seed(),
 			DBPath:            "./payments-db/",
 			SecureProofPolicy: false,
-			ChannelConfig: ChannelConfig{
-				VirtualChannelProxyFee:      "0.01",
-				QuarantineDurationSec:       600,
-				MisbehaviorFine:             "0.15",
-				ConditionalCloseDurationSec: 180,
-			},
-		},
-		OutGateway: TunnelRouteSection{
-			Key: tmp,
-			Payment: &TunnelSectionPayment{
-				Chain: []PaymentChain{
-					{
-						NodeKey:              tmp,
-						FeePerVirtualChannel: "0.0001",
+			ChannelsConfig: configPayments.ChannelsConfig{
+				SupportedCoins: configPayments.CoinTypes{
+					Ton: configPayments.CoinConfig{
+						Enabled: true,
+						VirtualTunnelConfig: configPayments.VirtualConfig{
+							ProxyMinFee:     "0",
+							ProxyFeePercent: 0,
+							AllowTunneling:  false,
+						},
+						BalanceControl: &configPayments.BalanceControlConfig{
+							DepositWhenAmountLessThan: "3",
+							DepositUpToAmount:         "5",
+							WithdrawWhenAmountReached: "0",
+						},
+						MisbehaviorFine: "3",
+						ExcessFeeTon:    "0.25",
+						Symbol:          "TON",
+						Decimals:        9,
 					},
-					{
-						NodeKey:              tmp,
-						FeePerVirtualChannel: "0",
+					Jettons: map[string]configPayments.CoinConfig{
+						"EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs": {
+							Enabled: false,
+							VirtualTunnelConfig: configPayments.VirtualConfig{
+								ProxyMaxCapacity: "0",
+								ProxyMinFee:      "0",
+								ProxyFeePercent:  0,
+								AllowTunneling:   false,
+							},
+							BalanceControl: &configPayments.BalanceControlConfig{
+								DepositWhenAmountLessThan: "5",
+								DepositUpToAmount:         "10",
+								WithdrawWhenAmountReached: "0",
+							},
+							MisbehaviorFine: "12",
+							ExcessFeeTon:    "0.35",
+							Symbol:          "USDT",
+							Decimals:        6,
+						},
 					},
+					ExtraCurrencies: map[uint32]configPayments.CoinConfig{},
 				},
-				PricePerPacketNano: 3,
+				BufferTimeToCommit:              3 * 3600,
+				QuarantineDurationSec:           6 * 3600,
+				ConditionalCloseDurationSec:     3 * 3600,
+				MinSafeVirtualChannelTimeoutSec: 300,
 			},
 		},
-		RouteOut: []TunnelRouteSection{
+	}
+
+	return cfg, SaveConfig(cfg, path)
+}
+
+func GenerateSharedConfig(src *Config, path string) (*SharedConfig, error) {
+	var pmt *TunnelSectionPayment
+	if src.PaymentsEnabled && (src.Payments.MinPricePerPacketInOut > 0 || src.Payments.MinPricePerPacketRoute > 0) {
+		ppk := ed25519.NewKeyFromSeed(src.Payments.PaymentsServerKey)
+		pmt = &TunnelSectionPayment{
+			Chain: []PaymentChain{
+				{
+					NodeKey:                      ppk.Public().(ed25519.PublicKey),
+					PercentFeePerVirtualChannel:  0,
+					MinFeePerVirtualChannel:      "0",
+					MaxCapacityPerVirtualChannel: "3",
+				},
+			},
+			JettonMaster:            nil,
+			ExtraCurrencyID:         0,
+			PricePerPacketRouteNano: src.Payments.MinPricePerPacketRoute,
+			PricePerPacketOutNano:   src.Payments.MinPricePerPacketInOut,
+		}
+	}
+
+	cfg := &SharedConfig{
+		NodesPool: []TunnelRouteSection{
 			{
-				Key:     tmp,
-				Payment: nil,
+				Key:     ed25519.NewKeyFromSeed(src.TunnelServerKey).Public().(ed25519.PublicKey),
+				Payment: pmt,
 			},
 		},
-		RouteIn: nil,
 	}
 
 	return cfg, SaveConfig(cfg, path)

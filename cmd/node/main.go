@@ -16,7 +16,6 @@ import (
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain"
-	pConfig "github.com/xssnick/ton-payment-network/tonpayments/config"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/db/leveldb"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
@@ -31,12 +30,14 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"strings"
 	"time"
 )
 
 var ConfigPath = flag.String("config", "config.json", "Config path")
 var PaymentNodeWith = flag.String("payment-node", "", "Payment node to open channel with")
 var Verbosity = flag.Int("v", 2, "verbosity")
+var GenerateSharedExample = flag.String("gen-shared-config", "", "Will generate shared config file with current node, at specified path")
 
 func init() {
 	flag.Parse()
@@ -73,6 +74,21 @@ func main() {
 	cfg, err := config.LoadConfig(*ConfigPath)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to load config")
+		return
+	}
+
+	if *GenerateSharedExample != "" {
+		if !strings.HasSuffix(*GenerateSharedExample, ".json") {
+			log.Fatal().Msg("shared config path must end with .json")
+			return
+		}
+
+		if _, err = config.GenerateSharedConfig(cfg, *GenerateSharedExample); err != nil {
+			log.Fatal().Err(err).Msg("failed to generate shared config")
+			return
+		}
+
+		log.Info().Str("path", *GenerateSharedExample).Msg("shared config generated")
 		return
 	}
 
@@ -350,7 +366,11 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 	}
 	log.Info().Str("addr", w.WalletAddress().String()).Msg("wallet initialized")
 
-	svc := tonpayments.NewService(apiClient, fdb, tr, w, inv, walletPrv, pConfig.ChannelConfig(cfg.Payments.ChannelConfig))
+	svc, err := tonpayments.NewService(apiClient, fdb, tr, w, inv, walletPrv, cfg.Payments.ChannelsConfig)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to init payments service")
+		return nil
+	}
 	tr.SetService(svc)
 	log.Info().Hex("pubkey", walletPrv.Public().(ed25519.PublicKey)).Msg("node initialized")
 
@@ -389,12 +409,12 @@ func preparePaymentChannel(ctx context.Context, pmt *tonpayments.Service, ch []b
 
 	// if no channels (or specified channel) are nod deployed, we deploy
 	if len(ch) == 0 {
-		log.Warn().Msg("No active onchain payment channel found, please input payment node id (pub key) in hex format, to deploy channel with:")
+		log.Warn().Msg("No active onchain payment channel found, please input payment node id (pub key) in base64 format, to deploy channel with:")
 		if _, err = fmt.Scanln(&inp); err != nil {
 			return nil, fmt.Errorf("failed to read input: %w", err)
 		}
 
-		ch, err = hex.DecodeString(inp)
+		ch, err = base64.StdEncoding.DecodeString(inp)
 		if err != nil {
 			return nil, fmt.Errorf("invalid id formet: %w", err)
 		}
@@ -402,16 +422,6 @@ func preparePaymentChannel(ctx context.Context, pmt *tonpayments.Service, ch []b
 
 	if len(ch) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("invalid channel id length")
-	}
-
-	log.Warn().Msg("Please input amount in TON to reserve in channel:")
-	if _, err = fmt.Scanln(&inp); err != nil {
-		return nil, fmt.Errorf("failed to read input: %w", err)
-	}
-
-	amt, err := tlb.FromTON(inp)
-	if err != nil {
-		return nil, fmt.Errorf("incorrect format of amount: %w", err)
 	}
 
 	ctxTm, cancel := context.WithTimeout(context.Background(), 150*time.Second)
@@ -434,135 +444,7 @@ func preparePaymentChannel(ctx context.Context, pmt *tonpayments.Service, ch []b
 		}
 		break
 	}
-	log.Info().Msg("Channel states exchange completed, address: " + addr.String() + " doing topup...")
-
-	ctxTm, cancel = context.WithTimeout(context.Background(), 150*time.Second)
-	err = pmt.TopupChannel(ctxTm, addr, amt)
-	cancel()
-	if err != nil {
-		return nil, fmt.Errorf("failed to topup channel with node: %w", err)
-	}
-	log.Info().Msg("Channel topup completed: " + addr.String())
+	log.Info().Str("address", addr.String()).Msg("Channel states exchange completed")
 
 	return ch, nil
 }
-
-/*
-func test() {
-	nodes, err := tGate.DiscoverNodes(context.Background())
-	if err != nil {
-		log.Fatal().Err(err).Msg("discover nodes failed")
-		return
-	}
-
-	if len(nodes) == 0 {
-		log.Fatal().Msg("no nodes found")
-		return
-	}
-
-	nodes = nodes[:1]
-
-	var chainTo, chainFrom []*tunnel.SectionInfo
-	for i, node := range nodes {
-		k, err := tunnel.GenerateEncryptionKeys(node)
-		if err != nil {
-			log.Fatal().Err(err).Int("i", i).Msg("generate to encryption keys failed")
-			return
-		}
-		chainTo = append(chainTo, &tunnel.SectionInfo{
-			Keys: k,
-		})
-	}
-
-	toUs, err := tunnel.GenerateEncryptionKeys(tunKey.Public().(ed25519.PublicKey))
-	if err != nil {
-		log.Fatal().Err(err).Msg("generate us encryption keys failed")
-		return
-	}
-	chainFrom = append(chainFrom, &tunnel.SectionInfo{
-		Keys: toUs,
-	})
-
-	tun, err := tGate.CreateRegularOutTunnel(context.Background(), chainTo, chainFrom, log.With().Str("component", "tunnel").Logger())
-	if err != nil {
-		log.Fatal().Err(err).Msg("create regular out tunnel failed")
-		return
-	}
-
-	extIP, _, err := tun.WaitForInit(context.Background())
-	if err != nil {
-		log.Fatal().Err(err).Msg("wait for tunnel init failed")
-		return
-	}
-
-	_, gKey, _ := ed25519.GenerateKey(nil)
-	tgw := adnl.NewGatewayWithListener(gKey, func(addr string) (net.PacketConn, error) {
-		println("TUN ADDR VIA: ", addr)
-		return tun, nil
-	})
-	if extIP != nil {
-		tgw.SetExternalIP(extIP)
-	}
-
-	/*tgw := adnl.NewGatewayWithListener(gKey, func(addr string) (net.PacketConn, error) {
-		println("TUN ADDR VIA: ", addr)
-		return tun, nil
-	})*/
-/*
-	if err = tgw.StartClient(); err != nil {
-		log.Fatal().Err(err).Msg("start tunnel client failed")
-		return
-	}
-
-	tunDhtClient, err := dht.NewClientFromConfigUrl(context.Background(), tgw, "https://ton-blockchain.github.io/global.config.json")
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to create TUN DHT client")
-		return
-	}
-
-	for {
-		time.Sleep(3 * time.Second)
-
-		overlayKey, _ := tl.Hash(tunnel.OverlayKey{
-			PaymentNode: make([]byte, 32),
-		})
-		println("SEARCHING VIA TUN", hex.EncodeToString(overlayKey))
-
-		nodesList, _, err := tunDhtClient.FindOverlayNodes(context.Background(), overlayKey)
-		if err != nil {
-			log.Error().Err(err).Msg("find overlay nodes failed")
-			continue
-		}
-
-		println("FOUND VIA TUN:", len(nodesList.List))
-	}
-
-	/*go func() {
-		var x uint32
-		for {
-			time.Sleep(3 * time.Second)
-
-			x++
-			var buf = make([]byte, 4)
-			binary.LittleEndian.PutUint32(buf, x)
-
-			_, err := tun.WriteTo(buf, net.UDPAddrFromAddrPort(netip.MustParseAddrPort("5.0.0.1:7777")))
-			if err != nil {
-				log.Fatal().Err(err).Msg("write to tunnel failed")
-			}
-
-			log.Info().Uint32("x", x).Msg("wrote to tunnel")
-		}
-	}()
-
-	for {
-		buf := make([]byte, 2048)
-		n, from, err := tun.ReadFrom(buf)
-		if err != nil {
-			log.Fatal().Err(err).Msg("read from tunnel failed")
-			return
-		}
-
-		log.Info().Str("data", string(buf[:n])).Str("from", from.String()).Msg("read from tunnel")
-	}*/
-//}

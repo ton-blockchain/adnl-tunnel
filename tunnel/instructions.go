@@ -27,8 +27,8 @@ import (
 var instructionOpcodes = map[uint32]reflect.Type{}
 
 func init() {
-	tl.Register(EncryptedMessage{}, "adnlTunnel.encryptedMessage tunnelPubKey:int256 instructions:bytes payload:bytes = adnlTunnel.EncryptedMessage")
-	tl.Register(EncryptedMessageCached{}, "adnlTunnel.encryptedMessageCached tunnelPubKey:int256 payload:bytes = adnlTunnel.EncryptedMessage")
+	tl.Register(EncryptedMessage{}, "adnlTunnel.encryptedMessage tunnelPubKey:int256 seqno:int instructions:bytes payload:bytes = adnlTunnel.EncryptedMessage")
+	tl.Register(EncryptedMessageCached{}, "adnlTunnel.encryptedMessageCached tunnelPubKey:int256 seqno:int payload:bytes = adnlTunnel.EncryptedMessage")
 	tl.Register(InstructionsContainer{}, "adnlTunnel.instructionsContainer rand:int list:(vector adnlTunnel.Instruction) = adnlTunnel.InstructionsContainer")
 
 	tl.Register(PaymentMeta{}, "adnlTunnel.paymentMeta seqno:long = adnlTunnel.PaymentMeta")
@@ -68,7 +68,7 @@ type Instruction interface {
 }
 
 type CachedAction interface {
-	Execute(ctx context.Context, s *Section, payload []byte) error
+	Execute(ctx context.Context, s *Section, msg *EncryptedMessageCached) error
 }
 
 // InstructionsContainer list of instructions to process on this node, order is matters
@@ -131,15 +131,17 @@ func (c InstructionsContainer) Serialize(buf *bytes.Buffer) error {
 
 // CacheInstruction save instruction to cache, to reduce next packets size
 type CacheInstruction struct {
-	Version      uint32
-	Instructions []any
+	Version          uint32
+	PayloadVerifyKey uint64
+	Instructions     []any
 }
 
 // Parse implemented manually for optimization
 func (ins *CacheInstruction) Parse(data []byte) ([]byte, error) {
 	ins.Version = binary.LittleEndian.Uint32(data)
+	ins.PayloadVerifyKey = binary.LittleEndian.Uint64(data[4:])
 
-	num := int(binary.LittleEndian.Uint32(data[4:]))
+	num := int(binary.LittleEndian.Uint32(data[12:]))
 	data = data[8:]
 
 	for i := 0; i < num; i++ {
@@ -168,9 +170,10 @@ func (ins *CacheInstruction) Parse(data []byte) ([]byte, error) {
 
 // Serialize implemented manually for optimization
 func (ins CacheInstruction) Serialize(buf *bytes.Buffer) error {
-	tmp := make([]byte, 8)
+	tmp := make([]byte, 16)
 	binary.LittleEndian.PutUint32(tmp, ins.Version)
-	binary.LittleEndian.PutUint32(tmp[4:], uint32(len(ins.Instructions)))
+	binary.LittleEndian.PutUint64(tmp[4:], ins.PayloadVerifyKey)
+	binary.LittleEndian.PutUint32(tmp[12:], uint32(len(ins.Instructions)))
 	buf.Write(tmp)
 
 	for i, s := range ins.Instructions {
@@ -309,7 +312,7 @@ type RouteCachedAction struct {
 	Route *Route
 }
 
-func (r *Route) Route(ctx context.Context, payload []byte, cached bool, instructions []byte) error {
+func (r *Route) Route(ctx context.Context, payload []byte, cached bool, instructions []byte, seqno uint32) error {
 	target := (*RouteTarget)(atomic.LoadPointer(&r.Target))
 
 	var paid bool
@@ -331,11 +334,13 @@ func (r *Route) Route(ctx context.Context, payload []byte, cached bool, instruct
 	if cached {
 		msg = EncryptedMessageCached{
 			SectionPubKey: target.SectionKey,
+			Seqno:         seqno,
 			Payload:       payload,
 		}
 	} else {
 		msg = EncryptedMessage{
 			SectionPubKey: target.SectionKey,
+			Seqno:         seqno,
 			Instructions:  instructions,
 			Payload:       payload,
 		}
@@ -353,12 +358,12 @@ func (r *Route) Route(ctx context.Context, payload []byte, cached bool, instruct
 	return nil
 }
 
-func (a *RouteCachedAction) Execute(ctx context.Context, s *Section, payload []byte) error {
+func (a *RouteCachedAction) Execute(ctx context.Context, s *Section, msg *EncryptedMessageCached) error {
 	if !s.gw.allowRouting {
 		return fmt.Errorf("instruction is not executable since routing is not allowed")
 	}
 
-	return a.Route.Route(ctx, payload, true, nil)
+	return a.Route.Route(ctx, msg.Payload, true, nil, msg.Seqno)
 }
 
 // RouteInstruction routes other encrypted instructions and payload to next node saved by BuildRouteInstruction
@@ -379,7 +384,7 @@ func (ins RouteInstruction) Execute(ctx context.Context, s *Section, msg *Encryp
 		return fmt.Errorf("route %d not exists", ins.RouteID)
 	}
 
-	return route.Route(ctx, msg.Payload, false, restInstructions)
+	return route.Route(ctx, msg.Payload, false, restInstructions, msg.Seqno)
 }
 
 // PaymentInstruction attached virtual payment channel state is used to get money for traffic
@@ -438,7 +443,7 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			return fmt.Errorf("payment channel should not have outgoing direction")
 		}
 
-		if time.Until(vc.Incoming.Deadline) < MinChannelTimeoutSec*time.Second {
+		if time.Until(vc.Incoming.SafeDeadline) < MinChannelTimeoutSec*time.Second {
 			return fmt.Errorf("payment channel deadline is too short")
 		}
 
@@ -448,8 +453,9 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		}
 
 		v = &PaymentChannel{
+			Key:      ins.Key,
 			Active:   !ins.Final,
-			Deadline: vc.Incoming.Deadline.Unix(),
+			Deadline: vc.Incoming.SafeDeadline.Unix(),
 			Capacity: capacity.Nano(),
 			Purpose:  ins.Purpose,
 		}
@@ -618,7 +624,7 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 	}
 
 	if s.gw.payments.Service != nil && s.gw.payments.MinPricePerPacketInOut > ins.PricePerPacket {
-		return fmt.Errorf("too low price per packet: %d, min is %d and %d", ins.PricePerPacket, s.gw.payments.MinPricePerPacketInOut)
+		return fmt.Errorf("too low price per packet: %d, min is %d", ins.PricePerPacket, s.gw.payments.MinPricePerPacketInOut)
 	}
 
 	if s.gw.payments.Service == nil {
@@ -706,11 +712,11 @@ func (ins ReportStatsInstruction) Execute(ctx context.Context, s *Section, msg *
 
 type SendOutCachedAction struct{}
 
-func (_ *SendOutCachedAction) Execute(ctx context.Context, s *Section, payload []byte) error {
+func (_ *SendOutCachedAction) Execute(ctx context.Context, s *Section, msg *EncryptedMessageCached) error {
 	if !s.gw.allowOut {
 		return fmt.Errorf("instruction is not executable since out is not allowed")
 	}
-	return s.out.Send(payload)
+	return s.out.Send(msg.Payload)
 }
 
 // SendOutInstruction used to send UDP packet by server which already bind port using BindOutInstruction
@@ -738,8 +744,8 @@ type DeliverInitiatorCachedAction struct {
 	tun Tunnel
 }
 
-func (d *DeliverInitiatorCachedAction) Execute(ctx context.Context, s *Section, payload []byte) error {
-	if err := d.tun.Process(payload, d.Metadata); err != nil {
+func (d *DeliverInitiatorCachedAction) Execute(ctx context.Context, s *Section, msg *EncryptedMessageCached) error {
+	if err := d.tun.Process(msg.Payload, d.Metadata); err != nil {
 		return fmt.Errorf("process recv message failed: %w", err)
 	}
 	return nil
@@ -955,11 +961,13 @@ func (o *Out) sendBack(obj tl.Serializable, isPayload bool) error {
 	if isPayload && o.UseCacheForPayload {
 		msg = EncryptedMessageCached{
 			SectionPubKey: o.InboundSectionKey,
+			Seqno:         atomic.AddUint32(&o.backSeqno, 1),
 			Payload:       pl,
 		}
 	} else {
 		msg = EncryptedMessage{
 			SectionPubKey: o.InboundSectionKey,
+			Seqno:         atomic.AddUint32(&o.backSeqno, 1),
 			Instructions:  o.Instructions,
 			Payload:       pl,
 		}
