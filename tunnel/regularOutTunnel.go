@@ -168,7 +168,7 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 		log:             log,
 		closerCtx:       closerCtx,
 		close:           closer,
-		packetsToPrepay: 200000,
+		packetsToPrepay: 5000,
 	}
 
 	list := append([]*SectionInfo{}, chainTo...)
@@ -562,37 +562,62 @@ func (t *RegularOutTunnel) prepareTunnelPings() (*EncryptedMessage, error) {
 	return msg, nil
 }
 
-func (t *RegularOutTunnel) resolveSection(key ed25519.PublicKey) *SectionInfo {
-	for i, info := range t.chainFrom {
-		if bytes.Equal(info.Keys.SectionPubKey, key) {
-			return t.chainFrom[i]
-		}
-	}
+func (t *RegularOutTunnel) resolveSection(key ed25519.PublicKey) (*SectionInfo, *SectionInfo) {
+	var next *SectionInfo
 
 	for i, info := range t.chainTo {
 		if bytes.Equal(info.Keys.SectionPubKey, key) {
-			return t.chainTo[i]
+			if i+1 < len(t.chainTo) {
+				next = t.chainTo[i+1]
+			} else if len(t.chainFrom) > 0 {
+				next = t.chainFrom[0]
+			}
+			return t.chainTo[i], next
 		}
 	}
 
-	return nil
+	for i, info := range t.chainFrom {
+		if bytes.Equal(info.Keys.SectionPubKey, key) {
+			if i+1 < len(t.chainFrom) {
+				next = t.chainFrom[i+1]
+			}
+
+			return t.chainFrom[i], next
+		}
+	}
+
+	return nil, nil
 }
 
 func (t *RegularOutTunnel) ReassembleInstructions(msg *EncryptedMessage) (*EncryptedMessage, error) {
 	t.mx.Lock()
 	defer t.mx.Unlock()
 
-	return t.reassembleInstructions(msg)
+	ln := len(msg.Instructions)
+
+	log.Debug().Int("len", ln).Str("section", base64.StdEncoding.EncodeToString(msg.SectionPubKey)).Msg("reassemble instructions")
+	rs, err := t.reassembleInstructions(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(rs.Instructions) != ln {
+		panic(fmt.Errorf("reassemble instructions failed, len %d, expected %d", len(rs.Instructions), ln).Error())
+	}
+
+	return rs, nil
 }
 
 func (t *RegularOutTunnel) reassembleInstructions(msg *EncryptedMessage) (*EncryptedMessage, error) {
 	var containers []*InstructionsContainer
 	var sections []*SectionInfo
+
+	sectionKey := msg.SectionPubKey
 	restInstructions := append([]byte{}, msg.Instructions...)
 	for {
-		sec := t.resolveSection(msg.SectionPubKey)
+		sec, nextSec := t.resolveSection(sectionKey)
 		if sec == nil {
-			return nil, fmt.Errorf("section %x not found", msg.SectionPubKey)
+			return nil, fmt.Errorf("section %x not found", sectionKey)
 		}
 
 		data, err := decryptStream(sec.Keys.CipherKeyCRC, sec.Keys.CipherKey, restInstructions)
@@ -615,9 +640,12 @@ func (t *RegularOutTunnel) reassembleInstructions(msg *EncryptedMessage) (*Encry
 		more := false
 		for y, ins := range container.List {
 			switch v := ins.(type) {
-			case RouteInstruction:
-				more = true
-			case BindOutInstruction:
+			case *RouteInstruction:
+				if nextSec != nil {
+					more = true
+					sectionKey = nextSec.Keys.SectionPubKey
+				}
+			case *BindOutInstruction:
 				inMsg := &EncryptedMessage{
 					SectionPubKey: v.InboundSectionPubKey,
 					Instructions:  v.InboundInstructions,
