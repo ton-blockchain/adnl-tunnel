@@ -29,7 +29,7 @@ var instructionOpcodes = map[uint32]reflect.Type{}
 func init() {
 	tl.Register(EncryptedMessage{}, "adnlTunnel.encryptedMessage tunnelPubKey:int256 seqno:int instructions:bytes payload:bytes = adnlTunnel.EncryptedMessage")
 	tl.Register(EncryptedMessageCached{}, "adnlTunnel.encryptedMessageCached tunnelPubKey:int256 seqno:int payload:bytes = adnlTunnel.EncryptedMessage")
-	tl.Register(InstructionsContainer{}, "adnlTunnel.instructionsContainer rand:int list:(vector adnlTunnel.Instruction) = adnlTunnel.InstructionsContainer")
+	tl.Register(InstructionsContainer{}, "adnlTunnel.instructionsContainer seqno:int list:(vector adnlTunnel.Instruction) = adnlTunnel.InstructionsContainer")
 
 	tl.Register(PaymentMeta{}, "adnlTunnel.paymentMeta seqno:long = adnlTunnel.PaymentMeta")
 	tl.Register(StateMeta{}, "adnlTunnel.stateMeta state:int = adnlTunnel.StateMeta")
@@ -44,7 +44,7 @@ func init() {
 	instructionOpcodes[tl.Register(RouteInstruction{}, "adnlTunnel.routeInstruction routeId:int nextChecksum:long = adnlTunnel.Instruction")] = reflect.TypeOf(RouteInstruction{})
 	instructionOpcodes[tl.Register(BuildRouteInstruction{}, "adnlTunnel.buildRouteInstruction targetADNL:int256 targetSectionPubKey:int256 routeId:int = adnlTunnel.Instruction")] = reflect.TypeOf(BuildRouteInstruction{})
 	instructionOpcodes[tl.Register(PaymentInstruction{}, "adnlTunnel.paymentInstruction paymentChannelState:bytes = adnlTunnel.Instruction")] = reflect.TypeOf(PaymentInstruction{})
-	instructionOpcodes[tl.Register(BindOutInstruction{}, "adnlTunnel.bindOutInstruction inboundNodeADNL:int256 inboundSectionPubKey:int256 inboundInstructions:bytes receiverPubKey:int256 useCachedForPayload:Bool = adnlTunnel.Instruction")] = reflect.TypeOf(BindOutInstruction{})
+	instructionOpcodes[tl.Register(BindOutInstruction{}, "adnlTunnel.bindOutInstruction inboundNodeADNL:int256 inboundSectionPubKey:int256 inboundInstructions:bytes receiverPubKey:int256 = adnlTunnel.Instruction")] = reflect.TypeOf(BindOutInstruction{})
 	instructionOpcodes[tl.Register(ReportStatsInstruction{}, "adnlTunnel.reportStatsInstruction inboundNodeADNL:int256 inboundSectionPubKey:int256 inboundInstructions:bytes receiverPubKey:int256 = adnlTunnel.Instruction")] = reflect.TypeOf(ReportStatsInstruction{})
 	instructionOpcodes[tl.Register(SendOutInstruction{}, "adnlTunnel.sendOutInstruction = adnlTunnel.Instruction")] = reflect.TypeOf(SendOutInstruction{})
 	instructionOpcodes[tl.Register(DeliverInstruction{}, "adnlTunnel.deliverInstruction = adnlTunnel.Instruction")] = reflect.TypeOf(DeliverInstruction{})
@@ -73,13 +73,13 @@ type CachedAction interface {
 
 // InstructionsContainer list of instructions to process on this node, order is matters
 type InstructionsContainer struct {
-	Rand uint32            // to randomize checksum
-	List []tl.Serializable // can be any instruction, for example RouteInstruction + PaymentInstruction
+	Seqno uint32            // to randomize checksum and deny repeats
+	List  []tl.Serializable // can be any instruction, for example RouteInstruction + PaymentInstruction
 } // min overhead size: 4 + 4 + (instructions count)*4 bytes
 
 // Parse implemented manually for optimization
 func (c *InstructionsContainer) Parse(data []byte) ([]byte, error) {
-	c.Rand = binary.LittleEndian.Uint32(data)
+	c.Seqno = binary.LittleEndian.Uint32(data)
 
 	num := int(binary.LittleEndian.Uint32(data[4:]))
 	data = data[8:]
@@ -111,7 +111,7 @@ func (c *InstructionsContainer) Parse(data []byte) ([]byte, error) {
 // Serialize implemented manually for optimization
 func (c InstructionsContainer) Serialize(buf *bytes.Buffer) error {
 	tmp := make([]byte, 8)
-	binary.LittleEndian.PutUint32(tmp, c.Rand)
+	binary.LittleEndian.PutUint32(tmp, c.Seqno)
 	binary.LittleEndian.PutUint32(tmp[4:], uint32(len(c.List)))
 	buf.Write(tmp)
 
@@ -322,7 +322,7 @@ func (r *Route) Route(ctx context.Context, payload []byte, cached bool, instruct
 	var paid bool
 	if target.PricePerPacket > 0 {
 		if r.PaymentReceived {
-			maxLoss := -int64(r.PacketsRouted/(100/LossAcceptablePercent) + LossAcceptableStartup)
+			maxLoss := -int64((r.PacketsRouted/100)*LossAcceptablePercent + LossAcceptableStartup)
 			if atomic.LoadInt64(&r.PrepaidPackets) > maxLoss {
 				// we not so care about concurrency here, and it is okay to allow couple packets overdraft
 				paid = atomic.AddInt64(&r.PrepaidPackets, -1) >= maxLoss
@@ -344,7 +344,6 @@ func (r *Route) Route(ctx context.Context, payload []byte, cached bool, instruct
 	} else {
 		msg = EncryptedMessage{
 			SectionPubKey: target.SectionKey,
-			Seqno:         seqno,
 			Instructions:  instructions,
 			Payload:       payload,
 		}
@@ -388,7 +387,7 @@ func (ins RouteInstruction) Execute(ctx context.Context, s *Section, msg *Encryp
 		return fmt.Errorf("route %d not exists", ins.RouteID)
 	}
 
-	return route.Route(ctx, msg.Payload, false, restInstructions, msg.Seqno)
+	return route.Route(ctx, msg.Payload, false, restInstructions, 0)
 }
 
 // PaymentInstruction attached virtual payment channel state is used to get money for traffic
@@ -600,7 +599,6 @@ type BindOutInstruction struct {
 	InboundSectionPubKey []byte `tl:"int256"`
 	InboundInstructions  []byte `tl:"bytes"`
 	ReceiverPubKey       []byte `tl:"int256"`
-	UseCacheForPayload   bool   `tl:"bool"`
 	PricePerPacket       uint64 `tl:"long"`
 }
 
@@ -654,7 +652,6 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			PayloadCipherKeyCRC: crc64.Checksum(sharedPayloadKey, crcTable),
 			InboundSectionKey:   ins.InboundSectionPubKey,
 			Instructions:        ins.InboundInstructions,
-			UseCacheForPayload:  ins.UseCacheForPayload,
 			PacketsSentOut:      0,
 			PacketsSentIn:       0,
 			PricePerPacket:      new(big.Int).SetUint64(ins.PricePerPacket),
@@ -670,7 +667,6 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		s.out.PayloadCipherKeyCRC = crc64.Checksum(sharedPayloadKey, crcTable)
 		s.out.InboundSectionKey = ins.InboundSectionPubKey
 		s.out.Instructions = ins.InboundInstructions
-		s.out.UseCacheForPayload = ins.UseCacheForPayload
 		s.out.PricePerPacket = new(big.Int).SetUint64(ins.PricePerPacket)
 		s.out.mx.Unlock()
 	}
@@ -845,7 +841,7 @@ func (o *Out) Send(payload []byte) error {
 	addr := net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip, uint16(pl.Port)))
 
 	if o.PricePerPacket.Sign() > 0 {
-		if atomic.LoadInt64(&o.PrepaidPacketsIn) < -int64(o.PacketsSentIn/(100/LossAcceptablePercent)+LossAcceptableStartup) {
+		if atomic.LoadInt64(&o.PrepaidPacketsIn) < -int64((o.PacketsSentIn/100)*LossAcceptablePercent+LossAcceptableStartup) {
 			return fmt.Errorf("prepaid `in` packets exceeds, cannot send more out messages")
 		}
 
@@ -864,7 +860,7 @@ func (o *Out) Send(payload []byte) error {
 	return nil
 }
 
-const LossAcceptablePercent = 20
+const LossAcceptablePercent = 15
 const LossAcceptableStartup = 5000
 
 func (o *Out) Listen(g *Gateway, threads int) {
@@ -882,7 +878,7 @@ func (o *Out) Listen(g *Gateway, threads int) {
 				}
 
 				if o.PricePerPacket.Sign() > 0 {
-					maxCredit := atomic.LoadUint64(&o.PacketsSentIn)/(100/LossAcceptablePercent) + LossAcceptableStartup
+					maxCredit := (atomic.LoadUint64(&o.PacketsSentIn)/100)*LossAcceptablePercent + LossAcceptableStartup
 					if prepaid := atomic.LoadInt64(&o.PrepaidPacketsIn); prepaid <= -int64(maxCredit) {
 						o.log.Debug().Int64("credit", prepaid).Uint64("sent", atomic.LoadUint64(&o.PacketsSentIn)).Msg("incoming packet was dropped because not paid")
 						continue
@@ -962,7 +958,7 @@ func (o *Out) sendBack(obj tl.Serializable, isPayload bool) error {
 	//TODO: add random padding to payload
 
 	var msg tl.Serializable
-	if isPayload && o.UseCacheForPayload {
+	if isPayload {
 		msg = EncryptedMessageCached{
 			SectionPubKey: o.InboundSectionKey,
 			Seqno:         atomic.AddUint32(&o.backSeqno, 1),
@@ -971,7 +967,6 @@ func (o *Out) sendBack(obj tl.Serializable, isPayload bool) error {
 	} else {
 		msg = EncryptedMessage{
 			SectionPubKey: o.InboundSectionKey,
-			Seqno:         atomic.AddUint32(&o.backSeqno, 1),
 			Instructions:  o.Instructions,
 			Payload:       pl,
 		}

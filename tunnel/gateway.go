@@ -71,7 +71,6 @@ type Out struct {
 	PayloadCipherKeyCRC uint64
 	InboundSectionKey   []byte
 	Instructions        []byte
-	UseCacheForPayload  bool
 
 	PacketsSentOut uint64
 	PacketsSentIn  uint64
@@ -104,6 +103,12 @@ type PaymentChannel struct {
 	mx sync.Mutex
 }
 
+type SeqnoWindow struct {
+	latest uint32
+	window [8]uint64 // 512
+	mx     sync.Mutex
+}
+
 type Section struct {
 	gw           *Gateway
 	lastPacketAt int64
@@ -119,9 +124,8 @@ type Section struct {
 
 	payments map[string]*PaymentChannel
 
-	lastSeqno   uint32
-	seqnoWindow [8]uint64 // 512
-	seqnoMx     sync.Mutex
+	seqno       SeqnoWindow
+	seqnoCached SeqnoWindow
 
 	log zerolog.Logger
 	mx  sync.RWMutex
@@ -164,7 +168,6 @@ type Gateway struct {
 type EncryptedMessage struct {
 	// used to generate shared key for decryption
 	SectionPubKey []byte `tl:"int256"`
-	Seqno         uint32 `tl:"int"`
 
 	// instructions are recursively encrypted, each receiver decrypts its own layer
 	Instructions []byte `tl:"bytes"`
@@ -173,7 +176,7 @@ type EncryptedMessage struct {
 	// just once, only some instructions use payload.
 	// payload can contain multiple payloads
 	Payload []byte `tl:"bytes"`
-} // min overhead size: 64 bytes
+} // min overhead size: 60 bytes
 
 type EncryptedMessageCached struct {
 	SectionPubKey []byte `tl:"int256"`
@@ -407,9 +410,9 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 				return fmt.Errorf("section is not exists")
 			}
 
-			if !sec.checkSeqno(m.Seqno) {
-				sec.log.Debug().Uint32("seqno", m.Seqno).Msg("repeating packet")
-				return fmt.Errorf("repeating packet")
+			if !sec.checkSeqno(m.Seqno, true) {
+				sec.log.Debug().Uint32("seqno", m.Seqno).Uint32("last_seqno", sec.seqnoCached.latest).Msg("repeating cached packet")
+				return fmt.Errorf("repeating cached packet")
 			}
 
 			if len(sec.cachedActions) == 0 {
@@ -454,15 +457,15 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 				g.mx.Unlock()
 			}
 
-			if !sec.checkSeqno(m.Seqno) {
-				sec.log.Debug().Uint32("seqno", m.Seqno).Msg("repeating packet")
-
-				return fmt.Errorf("repeating packet")
-			}
-
 			container, restInstructions, err := sec.decryptMessage(&m)
 			if err != nil {
 				return fmt.Errorf("decrypt failed: %w", err)
+			}
+
+			if !sec.checkSeqno(container.Seqno, false) {
+				sec.log.Debug().Uint32("seqno", container.Seqno).Uint32("last_seqno", sec.seqno.latest).Msg("repeating instructions packet")
+
+				return fmt.Errorf("repeating instructions packet")
 			}
 
 			if len(container.List) > 5 {

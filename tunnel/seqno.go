@@ -1,10 +1,10 @@
 package tunnel
 
-func (s *Section) shiftRightInPlace(diff uint32) {
-	totalBits := uint32(len(s.seqnoWindow) * 64)
+func (obj *SeqnoWindow) shiftRightInPlace(diff uint32) {
+	totalBits := uint32(len(obj.window) * 64)
 	if diff >= totalBits {
-		for i := range s.seqnoWindow {
-			s.seqnoWindow[i] = 0
+		for i := range obj.window {
+			obj.window[i] = 0
 		}
 		return
 	}
@@ -12,58 +12,63 @@ func (s *Section) shiftRightInPlace(diff uint32) {
 	wordShift := int(diff / 64)
 	bitShift := diff % 64
 
-	for i := len(s.seqnoWindow) - 1; i >= 0; i-- {
+	for i := len(obj.window) - 1; i >= 0; i-- {
 		srcIndex := i - wordShift
 		if srcIndex < 0 {
-			s.seqnoWindow[i] = 0
+			obj.window[i] = 0
 			continue
 		}
 
-		newVal := s.seqnoWindow[srcIndex] >> bitShift
+		newVal := obj.window[srcIndex] >> bitShift
 		if bitShift > 0 && srcIndex > 0 {
-			newVal |= s.seqnoWindow[srcIndex-1] << (64 - bitShift)
+			newVal |= obj.window[srcIndex-1] << (64 - bitShift)
 		}
-		s.seqnoWindow[i] = newVal
+		obj.window[i] = newVal
 	}
 }
 
-func (s *Section) checkSeqno(seqno uint32) bool {
-	totalBits := uint32(len(s.seqnoWindow) * 64)
+func (s *Section) checkSeqno(seqno uint32, cached bool) bool {
+	obj := &s.seqno
+	if cached {
+		obj = &s.seqnoCached
+	}
 
-	s.seqnoMx.Lock()
-	defer s.seqnoMx.Unlock()
+	totalBits := uint32(len(obj.window) * 64)
+
+	obj.mx.Lock()
+	defer obj.mx.Unlock()
 
 	// overflow, reset
-	if seqno < s.lastSeqno && (s.lastSeqno-seqno) > (1<<31) {
-		s.lastSeqno = seqno
-		for i := range s.seqnoWindow {
-			s.seqnoWindow[i] = 0
+	if seqno < obj.latest && (obj.latest-seqno) > (1<<31) {
+		obj.latest = seqno
+		for i := range obj.window {
+			obj.window[i] = 0
 		}
-		s.seqnoWindow[0] = 1 << 63
+		obj.window[0] = 1 << 63
 		return true
 	}
 
-	if seqno > s.lastSeqno {
-		diff := seqno - s.lastSeqno
+	if seqno > obj.latest {
+		diff := seqno - obj.latest
 		if diff >= totalBits {
-			for i := range s.seqnoWindow {
-				s.seqnoWindow[i] = 0
+			for i := range obj.window {
+				obj.window[i] = 0
 			}
-			s.seqnoWindow[0] = 1 << 63
+			obj.window[0] = 1 << 63
 		} else {
-			s.shiftRightInPlace(diff)
-			s.seqnoWindow[0] |= 1 << 63
+			obj.shiftRightInPlace(diff)
+			obj.window[0] |= 1 << 63
 		}
-		s.lastSeqno = seqno
+		obj.latest = seqno
 		return true
 	}
 
-	if seqno == s.lastSeqno {
+	if seqno == obj.latest {
 		// repeat
 		return false
 	}
 
-	diff := s.lastSeqno - seqno
+	diff := obj.latest - seqno
 	if diff >= totalBits {
 		// too old
 		return false
@@ -72,49 +77,49 @@ func (s *Section) checkSeqno(seqno uint32) bool {
 	wordIndex := diff / 64
 	bitIndex := 63 - diff%64
 
-	if (s.seqnoWindow[wordIndex]>>bitIndex)&1 != 0 {
+	if (obj.window[wordIndex]>>bitIndex)&1 != 0 {
 		// repeat
 		return false
 	}
 
-	s.seqnoWindow[wordIndex] |= 1 << bitIndex
+	obj.window[wordIndex] |= 1 << bitIndex
 	return true
 }
 
 /*
 func (s *Section) checkSeqnoFastShort(seqno uint32) bool {
 	// handle overflow, reset
-	if seqno < s.lastSeqno && (s.lastSeqno-seqno) > (1<<31) {
-		s.lastSeqno = seqno
-		s.seqnoWindow[0] = 1 << 63
+	if seqno < obj.latest && (obj.latest-seqno) > (1<<31) {
+		obj.latest = seqno
+		obj.window[0] = 1 << 63
 		return true
 	}
 
-	if seqno > s.lastSeqno {
-		diff := seqno - s.lastSeqno
+	if seqno > obj.latest {
+		diff := seqno - obj.latest
 		if diff >= 64 {
-			s.seqnoWindow[0] = 1 << 63
+			obj.window[0] = 1 << 63
 		} else {
-			s.seqnoWindow[0] = (s.seqnoWindow[0] >> diff) | (1 << 63)
+			obj.window[0] = (obj.window[0] >> diff) | (1 << 63)
 		}
-		s.lastSeqno = seqno
+		obj.latest = seqno
 		return true
 	}
 
-	if seqno == s.lastSeqno {
+	if seqno == obj.latest {
 		return false
 	}
 
-	diff := s.lastSeqno - seqno
+	diff := obj.latest - seqno
 	if diff >= 64 {
 		return false
 	}
 
-	if (s.seqnoWindow[0]>>(63-diff))&1 != 0 {
+	if (obj.window[0]>>(63-diff))&1 != 0 {
 		return false
 	}
 
-	s.seqnoWindow[0] |= 1 << (63 - diff)
+	obj.window[0] |= 1 << (63 - diff)
 	return true
 }
 */

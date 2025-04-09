@@ -2,17 +2,17 @@ package tunnel
 
 import (
 	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/binary"
 	"fmt"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/tl"
 	"hash/crc64"
+	"sync/atomic"
 )
 
 type EncryptionKeys struct {
 	CipherKey      []byte
 	CipherKeyCRC   uint64
+	Seqno          uint32
 	SectionPubKey  ed25519.PublicKey
 	ReceiverPubKey ed25519.PublicKey
 }
@@ -52,12 +52,10 @@ func (k *EncryptionKeys) EncryptInstructionsMessage(msg *EncryptedMessage, instr
 		return fmt.Errorf("no instructions")
 	}
 
-	rnd := make([]byte, 4)
-	_, _ = rand.Read(rnd)
-
+	seqno := atomic.AddUint32(&k.Seqno, 1)
 	container := &InstructionsContainer{
-		Rand: binary.LittleEndian.Uint32(rnd),
-		List: instructions,
+		Seqno: seqno,
+		List:  instructions,
 	}
 
 	instructionsData, err := tl.Serialize(container, true)

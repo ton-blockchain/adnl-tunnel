@@ -361,7 +361,12 @@ func (t *RegularOutTunnel) startSystemSender() {
 				}
 				lastPaymentMsg = lastMsg
 			} else {
-				lastMsg = lastPaymentMsg
+				msg, err := t.ReassembleInstructions(lastPaymentMsg)
+				if err != nil {
+					t.log.Error().Err(err).Msg("reassemble instructions failed")
+					continue
+				}
+				lastMsg = msg
 			}
 
 			if lastMsg != nil {
@@ -379,23 +384,11 @@ func (t *RegularOutTunnel) startSystemSender() {
 		if lastMsg == nil {
 			continue
 		}
-		lastMsg.Seqno = atomic.AddUint32(&t.seqnoForward, 1)
 
-		for {
-			if err = t.peer.SendCustomMessage(context.Background(), lastMsg); err != nil {
-				t.log.Error().Err(err).Msg("send tunnel payments failed, retrying")
-
-				select {
-				case <-t.closerCtx.Done():
-					return
-				case <-ticker.C:
-				}
-
-				continue
-			}
-			break
+		if err = t.peer.SendCustomMessage(context.Background(), lastMsg); err != nil {
+			t.log.Error().Err(err).Msg("send tunnel payments failed, retrying")
+			continue
 		}
-
 	}
 }
 
@@ -569,6 +562,93 @@ func (t *RegularOutTunnel) prepareTunnelPings() (*EncryptedMessage, error) {
 	return msg, nil
 }
 
+func (t *RegularOutTunnel) resolveSection(key ed25519.PublicKey) *SectionInfo {
+	for i, info := range t.chainFrom {
+		if bytes.Equal(info.Keys.SectionPubKey, key) {
+			return t.chainFrom[i]
+		}
+	}
+
+	for i, info := range t.chainTo {
+		if bytes.Equal(info.Keys.SectionPubKey, key) {
+			return t.chainTo[i]
+		}
+	}
+
+	return nil
+}
+
+func (t *RegularOutTunnel) ReassembleInstructions(msg *EncryptedMessage) (*EncryptedMessage, error) {
+	t.mx.Lock()
+	defer t.mx.Unlock()
+
+	return t.reassembleInstructions(msg)
+}
+
+func (t *RegularOutTunnel) reassembleInstructions(msg *EncryptedMessage) (*EncryptedMessage, error) {
+	var containers []*InstructionsContainer
+	var sections []*SectionInfo
+	restInstructions := append([]byte{}, msg.Instructions...)
+	for {
+		sec := t.resolveSection(msg.SectionPubKey)
+		if sec == nil {
+			return nil, fmt.Errorf("section %x not found", msg.SectionPubKey)
+		}
+
+		data, err := decryptStream(sec.Keys.CipherKeyCRC, sec.Keys.CipherKey, restInstructions)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt stream %x failed: %v", sec.Keys.SectionPubKey, err)
+		}
+
+		if len(data) < 12 {
+			return nil, fmt.Errorf("corrupted instructions, len %d", len(data))
+		}
+
+		var container = &InstructionsContainer{}
+		restInstructions, err = tl.Parse(container, data, true)
+		if err != nil {
+			return nil, fmt.Errorf("parse instructions failed: %v", err)
+		}
+		containers = append(containers, container)
+		sections = append(sections, sec)
+
+		more := false
+		for y, ins := range container.List {
+			switch v := ins.(type) {
+			case RouteInstruction:
+				more = true
+			case BindOutInstruction:
+				inMsg := &EncryptedMessage{
+					SectionPubKey: v.InboundSectionPubKey,
+					Instructions:  v.InboundInstructions,
+				}
+
+				inMsg, err = t.ReassembleInstructions(inMsg)
+				if err != nil {
+					return nil, fmt.Errorf("reassemble instructions failed: %v", err)
+				}
+				v.InboundInstructions = inMsg.Instructions
+
+				container.List[y] = v
+			}
+		}
+
+		if !more {
+			break
+		}
+	}
+
+	newMsg := &EncryptedMessage{}
+	for i := len(containers) - 1; i >= 0; i-- {
+		if err := sections[i].Keys.EncryptInstructionsMessage(newMsg, containers[i].List...); err != nil {
+			return nil, fmt.Errorf("encrypt failed: %w", err)
+		}
+	}
+	newMsg.Payload = msg.Payload
+
+	return newMsg, nil
+}
+
 func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 	t.mx.Lock()
 	defer t.mx.Unlock()
@@ -618,7 +698,7 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 			prepay -= p.PaidPackets
 			prepay += t.packetsToPrepay
 
-			if prepay <= 0 {
+			if prepay <= t.packetsToPrepay/2 {
 				continue
 			}
 
@@ -810,7 +890,6 @@ func (t *RegularOutTunnel) prepareInstructions(state uint32) error {
 					InboundSectionPubKey: backMsg.SectionPubKey,
 					InboundInstructions:  backMsg.Instructions,
 					ReceiverPubKey:       t.payloadKeys.SectionPubKey,
-					UseCacheForPayload:   true,
 					PricePerPacket:       price,
 				}, CacheInstruction{
 					Version:      uint32(time.Now().Unix()),
@@ -990,7 +1069,7 @@ func (t *RegularOutTunnel) WaitForInit(ctx context.Context) (net.IP, uint16, err
 			return t.externalAddr, t.externalPort, nil
 		case <-time.After(after):
 			if _, err := t.WriteTo(nil, initAddr); err != nil {
-				return nil, 0, fmt.Errorf("write initial instructions failed: %w", err)
+				log.Warn().Err(err).Msg("write initial instructions failed, retrying in 1 second...")
 			}
 			after = 1 * time.Second
 		}
@@ -1029,7 +1108,7 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return -1, fmt.Errorf("send instructions is empty")
 	}
 
-	if t.usePayments {
+	if t.usePayments && p != nil {
 		paid := atomic.LoadInt64(&t.packetsMinPaidOut)
 		consumed := atomic.LoadInt64(&t.packetsConsumedOut)
 		if paid < consumed {
@@ -1071,11 +1150,13 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 			Payload:       payload,
 		}
 	} else {
-		msg = &EncryptedMessage{
+		msg, err = t.ReassembleInstructions(&EncryptedMessage{
 			SectionPubKey: t.chainTo[0].Keys.SectionPubKey,
-			Seqno:         atomic.AddUint32(&t.seqnoForward, 1),
 			Instructions:  t.currentSendInstructions,
 			Payload:       payload,
+		})
+		if err != nil {
+			return -1, fmt.Errorf("reassemble instructions error: %w", err)
 		}
 	}
 
