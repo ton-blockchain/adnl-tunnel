@@ -623,7 +623,7 @@ func (t *RegularOutTunnel) reassembleInstructions(msg *EncryptedMessage) (*Encry
 					Instructions:  v.InboundInstructions,
 				}
 
-				inMsg, err = t.ReassembleInstructions(inMsg)
+				inMsg, err = t.reassembleInstructions(inMsg)
 				if err != nil {
 					return nil, fmt.Errorf("reassemble instructions failed: %v", err)
 				}

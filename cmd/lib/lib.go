@@ -44,7 +44,7 @@ import (
 )
 
 func init() {
-	log.Logger = zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger().Level(zerolog.InfoLevel)
+	log.Logger = zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger().Level(zerolog.DebugLevel)
 }
 
 var _gcAliveHolder []*tunnel.RegularOutTunnel
