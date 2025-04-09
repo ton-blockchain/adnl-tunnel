@@ -168,7 +168,7 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 		log:             log,
 		closerCtx:       closerCtx,
 		close:           closer,
-		packetsToPrepay: 5000,
+		packetsToPrepay: 200000,
 	}
 
 	list := append([]*SectionInfo{}, chainTo...)
@@ -519,7 +519,7 @@ func (t *RegularOutTunnel) openVirtualChannel(p *Payer, capacity *big.Int) (*Vir
 	}, nil
 }
 
-const ChannelCapacityForNumPayments = 50
+const ChannelCapacityForNumPayments = 30
 
 func (t *RegularOutTunnel) prepareTunnelPings() (*EncryptedMessage, error) {
 	t.mx.Lock()
