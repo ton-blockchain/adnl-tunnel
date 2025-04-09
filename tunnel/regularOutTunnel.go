@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -51,7 +52,8 @@ type Payer struct {
 	JettonMaster    *address.Address
 	ExtraCurrencyID uint32
 
-	ActiveChannels []*VirtualPaymentChannel
+	PaidPackets    int64
+	CurrentChannel *VirtualPaymentChannel
 }
 
 type SectionInfo struct {
@@ -96,9 +98,12 @@ type RegularOutTunnel struct {
 	pingSeqnoReceived    uint64
 	pingSeqnoReinitAt    uint64
 
-	packetsToPrepay   int64
-	packetsPrepaidIn  int64
-	packetsPrepaidOut int64
+	packetsToPrepay int64
+
+	packetsConsumedIn  int64
+	packetsConsumedOut int64
+	packetsMinPaidIn   int64
+	packetsMinPaidOut  int64
 
 	lastFullyCheckedAt int64
 
@@ -314,8 +319,8 @@ func (t *RegularOutTunnel) startSystemSender() {
 
 						if t.tunnelState > StateTypeConfiguring {
 							// TODO: remove after payments recovery logic, this is temp
-							t.packetsPrepaidOut = 0
-							t.packetsPrepaidIn = 0
+							t.packetsConsumedIn = 0
+							t.packetsConsumedOut = 0
 							t.seqnoRecv = 0
 							t.seqnoSend = 0
 
@@ -344,6 +349,7 @@ func (t *RegularOutTunnel) startSystemSender() {
 				// if loss is higher we cannot trust this tunnel and will notify user and stop payments until normalization
 				const LossNumAcceptable = 5000 // + 33%
 				if paidUsed > received+received/3+LossNumAcceptable {
+					// TODO: reinit something instead, with a new tunnel
 					t.log.Warn().Uint64("seqno", atomic.LoadUint64(&t.seqnoRecv)).Uint64("received", received).Msg("more than 33% incoming packets lost according to seqno, very unstable network or tunnel seems trying to cheat to get more payments")
 					continue
 				}
@@ -363,7 +369,11 @@ func (t *RegularOutTunnel) startSystemSender() {
 			}
 
 			loss := float64(paidUsed-received) / float64(paidUsed)
-			t.log.Debug().Float64("loss", loss).Uint64("payments_seqno_diff", t.paymentSeqno-t.paymentSeqnoReceived).Int64("prepaid_out", t.packetsPrepaidOut).Int64("prepaid_in", t.packetsPrepaidIn).Msg("tunnel stats")
+			t.log.Debug().Float64("loss", loss).
+				Uint64("payments_seqno_diff", t.paymentSeqno-t.paymentSeqnoReceived).
+				Int64("consumed_out", atomic.LoadInt64(&t.packetsConsumedOut)).
+				Int64("consumed_in", atomic.LoadInt64(&t.packetsConsumedIn)).
+				Msg("tunnel stats")
 		}
 
 		if lastMsg == nil {
@@ -516,23 +526,7 @@ func (t *RegularOutTunnel) openVirtualChannel(p *Payer, capacity *big.Int) (*Vir
 	}, nil
 }
 
-const ChannelCapacityForNumPayments = 20
-
-func (t *RegularOutTunnel) calcPrepayNum(v int64) *big.Int {
-	toPrepay := big.NewInt(t.packetsToPrepay)
-	left := big.NewInt(v)
-
-	if left.Cmp(big.NewInt(t.packetsToPrepay/2)) > 0 {
-		// no need to prepay, still enough
-		return big.NewInt(0)
-	}
-
-	if prep := new(big.Int).Sub(toPrepay, left); prep.Cmp(toPrepay) > 0 {
-		// we have negative balance, so we pay for it too
-		return prep
-	}
-	return toPrepay
-}
+const ChannelCapacityForNumPayments = 50
 
 func (t *RegularOutTunnel) prepareTunnelPings() (*EncryptedMessage, error) {
 	t.mx.Lock()
@@ -579,19 +573,21 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 	t.mx.Lock()
 	defer t.mx.Unlock()
 
-	msg := &EncryptedMessage{}
-
-	var mutations []func()
-
 	nodes := append([]*SectionInfo{}, t.chainTo...)
 	nodes = append(nodes, t.chainFrom...)
 
-	var toPrepayOut = t.calcPrepayNum(atomic.LoadInt64(&t.packetsPrepaidOut))
-	var toPrepayIn = t.calcPrepayNum(atomic.LoadInt64(&t.packetsPrepaidIn))
-	var toPrepayMax = toPrepayOut
-	if toPrepayMax.Cmp(toPrepayIn) < 0 {
-		toPrepayMax = toPrepayIn
+	var consumedOut = atomic.LoadInt64(&t.packetsConsumedOut)
+	var consumedIn = atomic.LoadInt64(&t.packetsConsumedIn)
+	var consumedMax = consumedOut
+	if consumedMax < consumedIn {
+		consumedMax = consumedIn
 	}
+
+	msg := &EncryptedMessage{}
+
+	debtMoved := false
+
+	var mutations []func()
 
 	for i := len(nodes) - 1; i >= 0; i-- {
 		if i == len(nodes)-1 {
@@ -611,92 +607,89 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 
 		routeId := binary.LittleEndian.Uint32(nodes[i+1].Keys.SectionPubKey)
 		// check if we need to pay
-		if p := nodes[i].PaymentInfo; p != nil {
-			var toPrepay = toPrepayOut
+		if p := nodes[i].PaymentInfo; p != nil && p.PricePerPacket > 0 {
+			prepay := consumedOut
 			if i >= len(t.chainTo) {
-				toPrepay = toPrepayIn
+				prepay = consumedIn
 			} else if i == len(t.chainTo)-1 {
 				// out gate
-				toPrepay = toPrepayMax
+				prepay = consumedMax
+			}
+			prepay -= p.PaidPackets
+			prepay += t.packetsToPrepay
+
+			if prepay <= 0 {
+				continue
 			}
 
-			if toPrepay.Sign() > 0 {
-				regularAmount := new(big.Int).Mul(big.NewInt(t.packetsToPrepay), new(big.Int).SetUint64(p.PricePerPacket))
+			price := new(big.Int).SetUint64(p.PricePerPacket)
+			if p.CurrentChannel == nil {
+				regularAmount := new(big.Int).Mul(big.NewInt(t.packetsToPrepay), price)
+				// make capacity enough for ChannelCapacityForNumPayments payments,
+				// but in fact it can be less if intermediate nodes not allow this amount
+				wantCap := new(big.Int).Mul(regularAmount, big.NewInt(ChannelCapacityForNumPayments))
 
-				chIndex := 0
-				for amtLeft := new(big.Int).Mul(toPrepay, new(big.Int).SetUint64(p.PricePerPacket)); amtLeft.Sign() > 0; {
-					if chIndex >= 5 {
-						// TODO: not like this, maybe one bigger channel
-						return nil, fmt.Errorf("too many payment channels consumed for single payment")
-					}
-
-					if len(p.ActiveChannels) <= chIndex {
-						// make capacity enough for ChannelCapacityForNumPayments payments,
-						// but in fact it can be less if intermediate nodes not allow this amount
-						wantCap := new(big.Int).Mul(regularAmount, big.NewInt(ChannelCapacityForNumPayments))
-
-						vc, err := t.openVirtualChannel(p, wantCap)
-						if err != nil {
-							return nil, fmt.Errorf("open virtual channel failed: %w", err)
-						}
-						p.ActiveChannels = append(p.ActiveChannels, vc)
-					}
-					vc := p.ActiveChannels[chIndex]
-
-					stateAmount := new(big.Int).Add(vc.LastAmount, amtLeft)
-
-					var isFinal bool
-					if stateAmount.Cmp(vc.Capacity) > 0 {
-						// full channel is exceeded, and it is still not enough to cover costs
-						// so we will attach second payment for the rest amount
-						stateAmount = vc.Capacity
-						isFinal = true
-						amtLeft = amtLeft.Sub(amtLeft, new(big.Int).Sub(vc.Capacity, vc.LastAmount))
-						// open new channel
-						chIndex++
-					} else {
-						// final if not enough for full next payment
-						isFinal = new(big.Int).Add(stateAmount, regularAmount).Cmp(vc.Capacity) > 0
-						amtLeft = big.NewInt(0)
-					}
-
-					st := &payments.VirtualChannelState{
-						Amount: tlb.FromNanoTON(stateAmount),
-					}
-					st.Sign(vc.Key)
-
-					pcs, err := tlb.ToCell(st)
-					if err != nil {
-						return nil, fmt.Errorf("state to cell failed: %w", err)
-					}
-
-					pi := PaymentInstruction{
-						Key:                 vc.Key.Public().(ed25519.PublicKey),
-						PaymentChannelState: pcs,
-						Final:               isFinal,
-					}
-
-					if i == len(t.chainTo)-1 {
-						pi.Purpose = PaymentPurposeOut << 32
-					} else {
-						pi.Purpose = (PaymentPurposeRoute << 32) | uint64(routeId)
-					}
-
-					t.log.Debug().Str("amount", st.Amount.String()).Hex("section_key", nodes[i].Keys.SectionPubKey).Msg("adding virtual channel payment state instruction")
-					instructions = append(instructions, pi)
-
-					// We do it this way for atomicity, because some error may happen during iteration,
-					// and it will produce double spend otherwise.
-					// Channel may still be opened but spend will not happen.
-					mutations = append(mutations, func() {
-						if isFinal {
-							p.ActiveChannels = p.ActiveChannels[1:]
-							return
-						}
-						vc.LastAmount.Set(stateAmount)
-					})
+				var err error
+				if p.CurrentChannel, err = t.openVirtualChannel(p, wantCap); err != nil {
+					return nil, fmt.Errorf("open virtual channel failed: %w", err)
 				}
 			}
+
+			left := new(big.Int).Sub(p.CurrentChannel.Capacity, p.CurrentChannel.LastAmount)
+
+			isFinal := true
+			payFor := new(big.Int).Div(left, price).Int64()
+			if payFor > prepay {
+				isFinal = false
+				payFor = prepay
+			}
+
+			if debt := prepay - payFor; debt > 0 {
+				// we cannot pay for this in single payment channel, amount is too big, will open new one with next payment and pay diff
+				debtMoved = true
+				t.log.Debug().Int64("packets_num", debt).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("part of the debt moved to pay later, channel is too small")
+			}
+
+			amount := new(big.Int).Mul(big.NewInt(payFor), price)
+			stateAmount := new(big.Int).Add(p.CurrentChannel.LastAmount, amount)
+
+			st := &payments.VirtualChannelState{
+				Amount: tlb.FromNanoTON(stateAmount),
+			}
+			st.Sign(p.CurrentChannel.Key)
+
+			pcs, err := tlb.ToCell(st)
+			if err != nil {
+				return nil, fmt.Errorf("state to cell failed: %w", err)
+			}
+
+			pi := PaymentInstruction{
+				Key:                 p.CurrentChannel.Key.Public().(ed25519.PublicKey),
+				PaymentChannelState: pcs,
+				Final:               isFinal,
+			}
+
+			if i == len(t.chainTo)-1 {
+				pi.Purpose = PaymentPurposeOut << 32
+			} else {
+				pi.Purpose = (PaymentPurposeRoute << 32) | uint64(routeId)
+			}
+
+			instructions = append(instructions, pi)
+			t.log.Debug().Str("amount", amount.String()).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("adding virtual channel payment state instruction")
+
+			// We do it this way for atomicity, because some error may happen during iteration,
+			// and it will produce double spend otherwise.
+			// Channel may still be opened but spend will not happen.
+			mutations = append(mutations, func() {
+				p.PaidPackets += payFor
+
+				if isFinal {
+					p.CurrentChannel = nil
+				} else {
+					p.CurrentChannel.LastAmount.Set(stateAmount)
+				}
+			})
 		}
 
 		instructions = append(instructions, RouteInstruction{
@@ -718,11 +711,47 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 	for _, mutation := range mutations {
 		mutation()
 	}
-	// TODO: better prepay based on each section
-	atomic.AddInt64(&t.packetsPrepaidIn, toPrepayMax.Int64())
-	atomic.AddInt64(&t.packetsPrepaidOut, toPrepayMax.Int64())
 
-	t.log.Debug().Int("size", len(t.currentSendInstructions)).Msg("payment instructions prepared")
+	var minPaidIn, minPaidOut int64 = math.MaxInt64, math.MaxInt64
+	for i, node := range nodes {
+		if i == len(nodes)-1 {
+			// ourself
+			continue
+		}
+
+		if node.PaymentInfo == nil {
+			continue
+		}
+
+		if i >= len(t.chainTo) {
+			// in
+			if minPaidIn > node.PaymentInfo.PaidPackets {
+				minPaidIn = node.PaymentInfo.PaidPackets
+			}
+		} else if i == len(t.chainTo)-1 {
+			// out gate
+			if minPaidOut > node.PaymentInfo.PaidPackets {
+				minPaidOut = node.PaymentInfo.PaidPackets
+			}
+			if minPaidIn > node.PaymentInfo.PaidPackets {
+				minPaidIn = node.PaymentInfo.PaidPackets
+			}
+		} else {
+			// out
+			if minPaidOut > node.PaymentInfo.PaidPackets {
+				minPaidOut = node.PaymentInfo.PaidPackets
+			}
+		}
+	}
+
+	atomic.StoreInt64(&t.packetsMinPaidIn, minPaidIn)
+	atomic.StoreInt64(&t.packetsMinPaidOut, minPaidOut)
+
+	t.log.Debug().Uint64("seqno", t.paymentSeqno).Int("size", len(t.currentSendInstructions)).Msg("payment instructions prepared")
+
+	if debtMoved {
+		t.requestPayment()
+	}
 
 	return msg, nil
 }
@@ -871,7 +900,9 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 
 			if t.usePayments && seqnoDiff > 0 {
 				atomic.AddUint64(&t.packetsRecvPaidConsumed, seqnoDiff)
-				if atomic.AddInt64(&t.packetsPrepaidIn, -int64(seqnoDiff)) < t.packetsToPrepay/2 {
+
+				paid := atomic.LoadInt64(&t.packetsMinPaidIn)
+				if paid-atomic.AddInt64(&t.packetsConsumedIn, int64(seqnoDiff)) < t.packetsToPrepay/2 {
 					t.requestPayment()
 				}
 			}
@@ -998,8 +1029,16 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return -1, fmt.Errorf("send instructions is empty")
 	}
 
-	if t.usePayments && atomic.AddInt64(&t.packetsPrepaidOut, -1) < t.packetsToPrepay/2 {
-		t.requestPayment()
+	if t.usePayments {
+		paid := atomic.LoadInt64(&t.packetsMinPaidOut)
+		consumed := atomic.LoadInt64(&t.packetsConsumedOut)
+		if paid < consumed {
+			return -1, fmt.Errorf("not enough packets prepaid, paid: %d, consumed: %d", paid, consumed)
+		}
+
+		if paid-atomic.AddInt64(&t.packetsConsumedOut, 1) < t.packetsToPrepay/2 {
+			t.requestPayment()
+		}
 	}
 
 	updAddr, ok := addr.(*net.UDPAddr)

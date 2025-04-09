@@ -242,6 +242,9 @@ func main() {
 					Str("routed", formatNum(st.Routed)).
 					Str("sent", formatNum(st.Sent)).
 					Str("received", formatNum(st.Received)).
+					Str("min_prepaid_route", formatNumInt(st.PrepaidPacketsRouteMin)).
+					Str("prepaid_out", formatNumInt(st.PrepaidPacketsOut)).
+					Str("prepaid_in", formatNumInt(st.PrepaidPacketsIn)).
 					Msg("stats summarized")
 			}
 		case "balance", "capacity":
@@ -278,6 +281,20 @@ func main() {
 }
 
 func formatNum(packets uint64) string {
+	sizes := []string{"", " K", " M", " B"}
+
+	sizeIndex := 0
+	sizeFloat := float64(packets)
+
+	for sizeFloat >= 1000 && sizeIndex < len(sizes)-1 {
+		sizeFloat /= 1000
+		sizeIndex++
+	}
+
+	return fmt.Sprintf("%.2f%s", sizeFloat, sizes[sizeIndex])
+}
+
+func formatNumInt(packets int64) string {
 	sizes := []string{"", " K", " M", " B"}
 
 	sizeIndex := 0
