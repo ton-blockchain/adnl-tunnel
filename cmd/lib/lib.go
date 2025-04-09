@@ -182,7 +182,7 @@ func WriteTunnel(tunIdx C.size_t, data *C.uint8_t, num C.size_t) C.int {
 		return 0
 	}
 
-	log.Debug().Int("num", int(num)).Msg("batch write to tunnel")
+	// log.Debug().Int("num", int(num)).Msg("batch write to tunnel")
 
 	tun := _gcAliveHolder[int(tunIdx)-1]
 
@@ -190,7 +190,7 @@ func WriteTunnel(tunIdx C.size_t, data *C.uint8_t, num C.size_t) C.int {
 	buf := unsafe.Slice((*byte)(unsafe.Pointer(data)), 1<<31)
 	off := 0
 
-	t := time.Now()
+	// t := time.Now()
 	for i := 0; i < int(num); i++ {
 		addr, err := parseSockAddr(buf[off:])
 		if err != nil {
@@ -209,7 +209,7 @@ func WriteTunnel(tunIdx C.size_t, data *C.uint8_t, num C.size_t) C.int {
 		off += 18 + sz
 	}
 
-	log.Debug().Int("num", int(num)).Dur("took", time.Since(t)).Msg("batch write to tunnel done")
+	// log.Debug().Int("num", int(num)).Dur("took", time.Since(t)).Msg("batch write to tunnel done")
 
 	return 1
 }
