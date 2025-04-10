@@ -457,7 +457,7 @@ func (t *RegularOutTunnel) buildTunnelPaymentsChain(paymentTunnel []PaymentTunne
 		chain[i] = transport.TunnelChainPart{
 			Target:   paymentTunnel[i].Key,
 			Capacity: new(big.Int).Set(requiredCapacities[i]),
-			Fee:      new(big.Int).Set(fees[i]),
+			Fee:      new(big.Int).Set(cumulativeFees[i]),
 			Deadline: base.Add(time.Duration(n-i) * hopTTL),
 		}
 	}

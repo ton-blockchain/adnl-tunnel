@@ -49,8 +49,8 @@ func TestBuildTunnelPaymentsChain(t *testing.T) {
 		t.Fatalf("Expected chain length 3, got %d", len(chain))
 	}
 
-	expectedFee1 := big.NewInt(10)
-	expectedFee2 := big.NewInt(10)
+	expectedFee1 := big.NewInt(21)
+	expectedFee2 := big.NewInt(11)
 	expectedFee3 := big.NewInt(1)
 	expectedFee4 := big.NewInt(0)
 	expectedCap1 := big.NewInt(61)
