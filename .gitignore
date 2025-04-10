@@ -1,5 +1,5 @@
 payments-db
 .idea
 adnl-tu*
-config*.json
+*.json
 tunnel-node

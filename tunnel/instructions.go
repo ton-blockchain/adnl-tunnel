@@ -476,16 +476,8 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 	v.mx.Lock()
 	defer v.mx.Unlock()
 
-	if !v.Active {
-		return fmt.Errorf("payment channel is inactive")
-	}
-
 	if v.Purpose != ins.Purpose {
 		return fmt.Errorf("purpose change is not allowed")
-	}
-
-	if v.Deadline-time.Now().Unix() < MinChannelTimeoutSec {
-		return fmt.Errorf("payment channel deadline is too short")
 	}
 
 	var lastAmt *big.Int
@@ -499,6 +491,14 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 	if amt.Sign() <= 0 {
 		// already processed payment
 		return nil
+	}
+
+	if !v.Active {
+		return fmt.Errorf("payment channel is inactive")
+	}
+
+	if v.Deadline-time.Now().Unix() < MinChannelTimeoutSec {
+		return fmt.Errorf("payment channel deadline is too short")
 	}
 
 	var mutation func()

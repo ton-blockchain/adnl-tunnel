@@ -115,11 +115,19 @@ func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, net
 	out := sharedCfg.NodesPool[0]
 	pool := sharedCfg.NodesPool[1:]
 
+	var siBack *SectionInfo
 	if cfg.TunnelSectionsNum > 1 {
 		for i := uint(0); i < cfg.TunnelSectionsNum-1; i++ {
 			si, err := paymentConfigToSections(&pool[i], false, pay)
 			if err != nil {
 				return nil, 0, nil, fmt.Errorf("convert config to section %d in `out` route failed: %w", i, err)
+			}
+
+			if siBack == nil {
+				siBack, err = paymentConfigToSections(&pool[i], false, pay)
+				if err != nil {
+					return nil, 0, nil, fmt.Errorf("convert config to section %d in `out` route failed: %w", i, err)
+				}
 			}
 
 			chainTo = append(chainTo, si)
@@ -145,6 +153,11 @@ func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, net
 	}
 
 	chainTo = append(chainTo, siGate)
+
+	if len(chainFrom) > 0 && siBack != nil {
+		// we need same first node to be able to connect to users with
+		chainFrom[len(chainFrom)-1] = siBack
+	}
 
 	var strTo string
 	strTo += "we -> "

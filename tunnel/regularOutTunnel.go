@@ -726,78 +726,76 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 			prepay -= p.PaidPackets
 			prepay += t.packetsToPrepay
 
-			if prepay <= t.packetsToPrepay/2 {
-				continue
-			}
+			if prepay > t.packetsToPrepay/2 {
+				price := new(big.Int).SetUint64(p.PricePerPacket)
+				if p.CurrentChannel == nil {
+					regularAmount := new(big.Int).Mul(big.NewInt(t.packetsToPrepay), price)
+					// make capacity enough for ChannelCapacityForNumPayments payments,
+					// but in fact it can be less if intermediate nodes not allow this amount
+					wantCap := new(big.Int).Mul(regularAmount, big.NewInt(ChannelCapacityForNumPayments))
 
-			price := new(big.Int).SetUint64(p.PricePerPacket)
-			if p.CurrentChannel == nil {
-				regularAmount := new(big.Int).Mul(big.NewInt(t.packetsToPrepay), price)
-				// make capacity enough for ChannelCapacityForNumPayments payments,
-				// but in fact it can be less if intermediate nodes not allow this amount
-				wantCap := new(big.Int).Mul(regularAmount, big.NewInt(ChannelCapacityForNumPayments))
-
-				var err error
-				if p.CurrentChannel, err = t.openVirtualChannel(p, wantCap); err != nil {
-					return nil, fmt.Errorf("open virtual channel failed: %w", err)
+					var err error
+					if p.CurrentChannel, err = t.openVirtualChannel(p, wantCap); err != nil {
+						return nil, fmt.Errorf("open virtual channel failed: %w", err)
+					}
 				}
-			}
 
-			left := new(big.Int).Sub(p.CurrentChannel.Capacity, p.CurrentChannel.LastAmount)
+				left := new(big.Int).Sub(p.CurrentChannel.Capacity, p.CurrentChannel.LastAmount)
 
-			isFinal := true
-			payFor := new(big.Int).Div(left, price).Int64()
-			if payFor > prepay {
-				isFinal = false
-				payFor = prepay
-			}
+				isFinal := true
+				payFor := new(big.Int).Div(left, price).Int64()
+				if payFor > prepay {
+					isFinal = false
+					payFor = prepay
+				}
 
-			if debt := prepay - payFor; debt > 0 {
-				// we cannot pay for this in single payment channel, amount is too big, will open new one with next payment and pay diff
-				debtMoved = true
-				t.log.Debug().Int64("packets_num", debt).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("part of the debt moved to pay later, channel is too small")
-			}
+				if debt := prepay - payFor; debt > 0 {
+					// we cannot pay for this in single payment channel, amount is too big, will open new one with next payment and pay diff
+					debtMoved = true
+					t.log.Debug().Int64("packets_num", debt).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("part of the debt moved to pay later, channel is too small")
+				}
 
-			amount := new(big.Int).Mul(big.NewInt(payFor), price)
-			stateAmount := new(big.Int).Add(p.CurrentChannel.LastAmount, amount)
+				amount := new(big.Int).Mul(big.NewInt(payFor), price)
+				stateAmount := new(big.Int).Add(p.CurrentChannel.LastAmount, amount)
 
-			st := &payments.VirtualChannelState{
-				Amount: tlb.FromNanoTON(stateAmount),
-			}
-			st.Sign(p.CurrentChannel.Key)
+				st := &payments.VirtualChannelState{
+					Amount: tlb.FromNanoTON(stateAmount),
+				}
+				st.Sign(p.CurrentChannel.Key)
 
-			pcs, err := tlb.ToCell(st)
-			if err != nil {
-				return nil, fmt.Errorf("state to cell failed: %w", err)
-			}
+				pcs, err := tlb.ToCell(st)
+				if err != nil {
+					return nil, fmt.Errorf("state to cell failed: %w", err)
+				}
 
-			pi := PaymentInstruction{
-				Key:                 p.CurrentChannel.Key.Public().(ed25519.PublicKey),
-				PaymentChannelState: pcs,
-				Final:               isFinal,
-			}
+				pi := PaymentInstruction{
+					Key:                 p.CurrentChannel.Key.Public().(ed25519.PublicKey),
+					PaymentChannelState: pcs,
+					Final:               isFinal,
+				}
 
-			if i == len(t.chainTo)-1 {
-				pi.Purpose = PaymentPurposeOut << 32
-			} else {
-				pi.Purpose = (PaymentPurposeRoute << 32) | uint64(routeId)
-			}
-
-			instructions = append(instructions, pi)
-			t.log.Debug().Str("amount", amount.String()).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("adding virtual channel payment state instruction")
-
-			// We do it this way for atomicity, because some error may happen during iteration,
-			// and it will produce double spend otherwise.
-			// Channel may still be opened but spend will not happen.
-			mutations = append(mutations, func() {
-				p.PaidPackets += payFor
-
-				if isFinal {
-					p.CurrentChannel = nil
+				if i == len(t.chainTo)-1 {
+					pi.Purpose = PaymentPurposeOut << 32
 				} else {
-					p.CurrentChannel.LastAmount.Set(stateAmount)
+					pi.Purpose = (PaymentPurposeRoute << 32) | uint64(routeId)
 				}
-			})
+
+				instructions = append(instructions, pi)
+				t.log.Debug().Str("amount", amount.String()).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("adding virtual channel payment state instruction")
+
+				// We do it this way for atomicity, because some error may happen during iteration,
+				// and it will produce double spend otherwise.
+				// Channel may still be opened but spend will not happen.
+				mutations = append(mutations, func() {
+					p.PaidPackets += payFor
+
+					if isFinal {
+						p.CurrentChannel = nil
+					} else {
+						p.CurrentChannel.LastAmount.Set(stateAmount)
+					}
+				})
+			}
 		}
 
 		instructions = append(instructions, RouteInstruction{
