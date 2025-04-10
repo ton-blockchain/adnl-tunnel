@@ -14,7 +14,6 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/dht"
 	"github.com/xssnick/tonutils-go/tl"
 	"hash/crc64"
-	"math"
 	"math/big"
 	"net"
 	"sync"
@@ -219,9 +218,9 @@ type SectionStats struct {
 	Sent     uint64
 	Received uint64
 
-	PrepaidPacketsRouteMin int64
-	PrepaidPacketsIn       int64
-	PrepaidPacketsOut      int64
+	PrepaidPacketsRoute []int64
+	PrepaidPacketsIn    int64
+	PrepaidPacketsOut   int64
 }
 
 func (g *Gateway) GetPacketsStats() map[string]*SectionStats {
@@ -240,12 +239,9 @@ func (g *Gateway) GetPacketsStats() map[string]*SectionStats {
 
 		section.mx.RLock()
 		if len(section.routes) > 0 {
-			stats.PrepaidPacketsRouteMin = math.MaxInt64
 			for _, route := range section.routes {
 				stats.Routed += atomic.LoadUint64(&route.PacketsRouted)
-				if num := atomic.LoadInt64(&route.PrepaidPackets); num < stats.PrepaidPacketsRouteMin {
-					stats.PrepaidPacketsRouteMin = num
-				}
+				stats.PrepaidPacketsRoute = append(stats.PrepaidPacketsRoute, atomic.LoadInt64(&route.PrepaidPackets))
 			}
 		}
 

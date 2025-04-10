@@ -242,7 +242,7 @@ func main() {
 					Str("routed", formatNum(st.Routed)).
 					Str("sent", formatNum(st.Sent)).
 					Str("received", formatNum(st.Received)).
-					Str("min_prepaid_route", formatNumInt(st.PrepaidPacketsRouteMin)).
+					Ints64("prepaid_routes", st.PrepaidPacketsRoute).
 					Str("prepaid_out", formatNumInt(st.PrepaidPacketsOut)).
 					Str("prepaid_in", formatNumInt(st.PrepaidPacketsIn)).
 					Msg("stats summarized")
