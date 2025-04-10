@@ -84,9 +84,9 @@ func (l *LogWriter) Write(p []byte) (n int, err error) {
 	}
 
 	msg := string(p[2:])
-	println("|" + msg + "|")
+	println(p[0]-0x30, "|"+msg+"|")
 
-	C.write_log(l.logger, C.CString(msg), C.size_t(len(msg)), C.int(p[0]-0x30))
+	C.write_log(l.logger, C.CString(msg), C.size_t(len(p)-2), C.int(p[0]-0x30))
 	return len(p), nil
 }
 
@@ -117,6 +117,8 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 				logger: logger,
 			}
 		})).With().Timestamp().Logger().Level(zerolog.InfoLevel)
+
+	log.Info().Str("path", path).Msg("using config")
 
 	data, err := os.ReadFile(path)
 	if err != nil {
