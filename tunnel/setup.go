@@ -32,7 +32,7 @@ import (
 	cRand "crypto/rand"
 )
 
-func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, netCfg *liteclient.GlobalConfig) (*RegularOutTunnel, uint16, net.IP, error) {
+func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, netCfg *liteclient.GlobalConfig, logger zerolog.Logger) (*RegularOutTunnel, uint16, net.IP, error) {
 	if len(sharedCfg.NodesPool) == 0 {
 		return nil, 0, nil, fmt.Errorf("no nodes pool provided, please specify at least one node in config file")
 	}
@@ -73,8 +73,6 @@ func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, net
 		return nil, 0, nil, fmt.Errorf("failed to create DHT client: %w", err)
 	}
 
-	zLogger := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger().Level(log.Logger.GetLevel())
-
 	var pay *tonpayments.Service
 	if cfg.PaymentsEnabled {
 		lsClient := liteclient.NewConnectionPool()
@@ -84,13 +82,13 @@ func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, net
 
 		apiClient := ton.NewAPIClient(lsClient, ton.ProofCheckPolicyFast).WithRetry().WithTimeout(10 * time.Second)
 
-		pay, err = preparePayerPayments(context.Background(), apiClient, dhtClient, cfg, sharedCfg, zLogger, ml)
+		pay, err = preparePayerPayments(context.Background(), apiClient, dhtClient, cfg, sharedCfg, logger, ml)
 		if err != nil {
 			return nil, 0, nil, fmt.Errorf("prepare payments failed: %w", err)
 		}
 	}
 
-	tGate := NewGateway(gate, dhtClient, tunKey, zLogger.With().Str("component", "gateway").Logger(), PaymentConfig{
+	tGate := NewGateway(gate, dhtClient, tunKey, logger.With().Str("component", "gateway").Logger(), PaymentConfig{
 		Service: pay,
 	})
 	go func() {
@@ -100,7 +98,7 @@ func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, net
 		}
 	}()
 
-	zLogger.Info().Msg("initializing adnl tunnel...")
+	logger.Info().Msg("initializing adnl tunnel...")
 
 	var chainTo, chainFrom []*SectionInfo
 
@@ -156,19 +154,19 @@ func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, net
 		Keys: toUs,
 	})
 
-	tun, err := tGate.CreateRegularOutTunnel(context.Background(), chainTo, chainFrom, zLogger.With().Str("component", "tunnel").Logger())
+	tun, err := tGate.CreateRegularOutTunnel(context.Background(), chainTo, chainFrom, logger.With().Str("component", "tunnel").Logger())
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("create regular out tunnel failed: %w", err)
 	}
 
-	zLogger.Info().Msg("waiting adnl tunnel confirmation...")
+	logger.Info().Msg("waiting adnl tunnel confirmation...")
 
 	extIP, extPort, err := tun.WaitForInit(context.Background())
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("wait for tunnel init failed: %w", err)
 	}
 
-	zLogger.Info().Msg("adnl tunnel is ready")
+	logger.Info().Msg("adnl tunnel is ready")
 
 	return tun, extPort, extIP, nil
 }

@@ -152,7 +152,7 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 		return C.Tunnel{}
 	}
 
-	tun, port, ip, err := tunnel.PrepareTunnel(&cfg, &sharedCfg, &netCfg)
+	tun, port, ip, err := tunnel.PrepareTunnel(&cfg, &sharedCfg, &netCfg, log.Logger)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to prepare tunnel")
 		return C.Tunnel{}
