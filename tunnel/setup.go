@@ -146,6 +146,19 @@ func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, net
 
 	chainTo = append(chainTo, siGate)
 
+	var strTo, strFrom string
+	for _, node := range chainTo {
+		strTo += base64.StdEncoding.EncodeToString(node.Keys.ReceiverPubKey) + " -> "
+	}
+	strTo += "out"
+
+	for _, node := range chainFrom {
+		strFrom += base64.StdEncoding.EncodeToString(node.Keys.ReceiverPubKey) + " -> "
+	}
+	strFrom += "in"
+
+	logger.Info().Str("to", strTo).Str("from", strFrom).Msgf("initializing tunnel...")
+
 	toUs, err := GenerateEncryptionKeys(tunKey.Public().(ed25519.PublicKey))
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("generate us encryption keys failed: %w", err)
