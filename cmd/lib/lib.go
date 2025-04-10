@@ -15,6 +15,8 @@ typedef void (*RecvCallback)(void* next, uint8_t* data, size_t num);
 
 typedef void (*ReinitCallback)(void* next, struct sockaddr* data);
 
+typedef void (*Logger)(const char *text, const size_t len, const int level);
+
 
 // we need it because we cannot call C func by pointer directly from go
 static inline void on_recv_batch_ready(RecvCallback cb, void* next, void* data, size_t num) {
@@ -23,6 +25,10 @@ static inline void on_recv_batch_ready(RecvCallback cb, void* next, void* data, 
 
 static inline void on_reinit(ReinitCallback cb, void* next, void* data) {
 	cb(next, (struct sockaddr*)data);
+}
+
+static inline void write_log(Logger log, const char *text, const size_t len, const int level) {
+	log(text, len, level);
 }
 */
 import "C"
@@ -42,10 +48,6 @@ import (
 	"time"
 	"unsafe"
 )
-
-func init() {
-	log.Logger = zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger().Level(zerolog.InfoLevel)
-}
 
 var _gcAliveHolder []*tunnel.RegularOutTunnel
 
@@ -72,10 +74,49 @@ func parseSockAddr(at []byte) (*net.UDPAddr, error) {
 	return &net.UDPAddr{IP: at[4:8], Port: int(at[2])<<8 + int(at[3])}, nil
 }
 
+type LogWriter struct {
+	logger C.Logger
+}
+
+func (l *LogWriter) Write(p []byte) (n int, err error) {
+	if len(p) < 2 {
+		return 0, errors.New("invalid message")
+	}
+
+	msg := string(p[2:])
+	C.write_log(l.logger, C.CString(msg), C.size_t(len(p)-2), C.int(p[0]-0x30))
+	return len(p), nil
+}
+
 //export PrepareTunnel
 //goland:noinspection ALL
-func PrepareTunnel(onRecv C.RecvCallback, onReinit C.ReinitCallback, nextOnRecv, nextOnReinit unsafe.Pointer, configPath *C.char, configPathLen C.int, networkConfigJson *C.char, networkConfigJsonLen C.int) C.Tunnel {
+func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCallback, nextOnRecv, nextOnReinit unsafe.Pointer, configPath *C.char, configPathLen C.int, networkConfigJson *C.char, networkConfigJsonLen C.int) C.Tunnel {
 	path := string(C.GoBytes(unsafe.Pointer(configPath), configPathLen))
+
+	log.Logger = zerolog.New(zerolog.NewConsoleWriter(
+		func(w *zerolog.ConsoleWriter) {
+			w.NoColor = true
+			w.FormatTimestamp = func(i interface{}) string { return "" }
+			w.FormatLevel = func(i interface{}) string {
+				switch i.(string) {
+				case zerolog.LevelFatalValue:
+					return "0"
+				case zerolog.LevelErrorValue:
+					return "1"
+				case zerolog.LevelWarnValue:
+					return "2"
+				case zerolog.LevelInfoValue:
+					return "3"
+				default:
+					return "4"
+				}
+			}
+			w.Out = &LogWriter{
+				logger: logger,
+			}
+		})).With().Timestamp().Logger().Level(zerolog.InfoLevel)
+
+	log.Info().Str("path", path).Msg("using config")
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -161,7 +202,7 @@ func PrepareTunnel(onRecv C.RecvCallback, onReinit C.ReinitCallback, nextOnRecv,
 			}
 
 			if num >= 100 || (num > 0 && time.Since(sinceLastBatch) >= 10*time.Millisecond) {
-				C.on_recv_batch_ready((C.RecvCallback)(onRecv), nextOnRecv, unsafe.Pointer(&buf[0]), C.size_t(num))
+				C.on_recv_batch_ready(onRecv, nextOnRecv, unsafe.Pointer(&buf[0]), C.size_t(num))
 				num, off = 0, 0
 				sinceLastBatch = time.Now()
 			}
