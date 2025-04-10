@@ -28,7 +28,7 @@ static inline void on_reinit(ReinitCallback cb, void* next, void* data) {
 }
 
 static inline void write_log(Logger log, const char *text, const size_t len, const int level) {
-
+	log(text, len, level);
 }
 */
 import "C"
@@ -84,8 +84,6 @@ func (l *LogWriter) Write(p []byte) (n int, err error) {
 	}
 
 	msg := string(p[2:])
-	println(p[0]-0x30, "|"+msg+"|")
-
 	C.write_log(l.logger, C.CString(msg), C.size_t(len(p)-2), C.int(p[0]-0x30))
 	return len(p), nil
 }
@@ -204,7 +202,7 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 			}
 
 			if num >= 100 || (num > 0 && time.Since(sinceLastBatch) >= 10*time.Millisecond) {
-				C.on_recv_batch_ready((C.RecvCallback)(onRecv), nextOnRecv, unsafe.Pointer(&buf[0]), C.size_t(num))
+				C.on_recv_batch_ready(onRecv, nextOnRecv, unsafe.Pointer(&buf[0]), C.size_t(num))
 				num, off = 0, 0
 				sinceLastBatch = time.Now()
 			}
