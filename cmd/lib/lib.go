@@ -37,7 +37,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/ton-blockchain/adnl-tunnel/config"
@@ -84,7 +83,7 @@ func (l *LogWriter) Write(p []byte) (n int, err error) {
 		return 0, errors.New("invalid message")
 	}
 
-	msg := string(p[1:])
+	msg := string(p[2:])
 	println("|" + msg + "|")
 
 	C.write_log(l.logger, C.CString(msg), C.size_t(len(msg)), C.int(p[0]-0x30))
@@ -101,7 +100,18 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 			w.NoColor = true
 			w.FormatTimestamp = func(i interface{}) string { return "" }
 			w.FormatLevel = func(i interface{}) string {
-				return fmt.Sprintf("%d", i)
+				switch i.(string) {
+				case zerolog.LevelFatalValue:
+					return "0"
+				case zerolog.LevelErrorValue:
+					return "1"
+				case zerolog.LevelWarnValue:
+					return "2"
+				case zerolog.LevelInfoValue:
+					return "3"
+				default:
+					return "4"
+				}
 			}
 			w.Out = &LogWriter{
 				logger: logger,
