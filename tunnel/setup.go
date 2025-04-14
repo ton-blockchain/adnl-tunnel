@@ -363,7 +363,7 @@ func paymentConfigToSections(s *config.TunnelRouteSection, isOut bool, pay *tonp
 			jettonStr = jetton.Bounce(true).String()
 		}
 
-		cc, err := pay.ResolveCoinConfig(jettonStr, s.Payment.ExtraCurrencyID)
+		cc, err := pay.ResolveCoinConfig(jettonStr, s.Payment.ExtraCurrencyID, true)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve coin config: %w", err)
 		}
