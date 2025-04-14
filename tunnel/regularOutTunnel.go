@@ -319,10 +319,12 @@ func (t *RegularOutTunnel) startSystemSender() {
 
 						if t.tunnelState > StateTypeConfiguring {
 							// TODO: remove after payments recovery logic, this is temp
-							t.packetsConsumedIn = 0
-							t.packetsConsumedOut = 0
 							t.seqnoRecv = 0
 							t.seqnoSend = 0
+							if t.paymentSeqno > 0 {
+								// to resend last payment msg
+								t.paymentSeqnoReceived = t.paymentSeqno - 1
+							}
 
 							t.log.Info().Msg("tunnel reinitialized successfully")
 							break

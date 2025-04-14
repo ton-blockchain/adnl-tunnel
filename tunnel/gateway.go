@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/kevinms/leakybucket-go"
 	"github.com/rs/zerolog"
+	"github.com/ton-blockchain/adnl-tunnel/metrics"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/tonutils-go/adnl"
@@ -191,7 +192,7 @@ type PaymentConfig struct {
 
 func NewGateway(gate *adnl.Gateway, dht *dht.Client, key ed25519.PrivateKey, logger zerolog.Logger, pay PaymentConfig) *Gateway {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Gateway{
+	g := &Gateway{
 		gate:            gate,
 		key:             key,
 		dht:             dht,
@@ -211,6 +212,11 @@ func NewGateway(gate *adnl.Gateway, dht *dht.Client, key ed25519.PrivateKey, log
 			},
 		},
 	}
+
+	if metrics.Registered {
+
+	}
+	return g
 }
 
 type SectionStats struct {
@@ -361,9 +367,14 @@ func (g *Gateway) keepAlivePeersAndSections() {
 				if atomic.LoadInt64(&section.lastPacketAt) < tm-SectionMaxInactiveSec {
 					sectionsToClose = append(sectionsToClose, section)
 				} else {
-					for _, channel := range section.payments {
+					for k, channel := range section.payments {
 						if channel.Active && channel.Deadline < tm {
 							paymentsToClose = append(paymentsToClose, channel)
+						}
+
+						if !channel.Active && section.mx.TryLock() {
+							delete(section.payments, k)
+							section.mx.Unlock()
 						}
 					}
 				}

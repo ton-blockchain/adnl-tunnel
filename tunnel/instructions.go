@@ -434,9 +434,15 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			return fmt.Errorf("get virtual channel failed: %w", err)
 		}
 
-		if vc.Status != db.VirtualChannelStateActive {
-			return fmt.Errorf("payment channel is not active")
+		var last *payments.VirtualChannelState
+		if ins.PaymentChannelState != nil {
+			last = &payments.VirtualChannelState{}
+			if err = tlb.LoadFromCell(last, ins.PaymentChannelState.BeginParse()); err != nil {
+				return fmt.Errorf("incorrect latest state cell: %w", err)
+			}
 		}
+
+		// TODO: recover paid packets num after restart
 
 		if vc.Incoming == nil {
 			return fmt.Errorf("payment channel direction is incorrect")
@@ -446,21 +452,18 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			return fmt.Errorf("payment channel should not have outgoing direction")
 		}
 
-		if time.Until(vc.Incoming.SafeDeadline) < MinChannelTimeoutSec*time.Second {
-			return fmt.Errorf("payment channel deadline is too short")
-		}
-
 		capacity, err := tlb.FromTON(vc.Incoming.Capacity)
 		if err != nil {
 			return fmt.Errorf("incorrect capacity: %w", err)
 		}
 
 		v = &PaymentChannel{
-			Key:      ins.Key,
-			Active:   !ins.Final,
-			Deadline: vc.Incoming.SafeDeadline.Unix(),
-			Capacity: capacity.Nano(),
-			Purpose:  ins.Purpose,
+			Key:         ins.Key,
+			Active:      vc.Status == db.VirtualChannelStateActive && time.Until(vc.Incoming.SafeDeadline) >= MinChannelTimeoutSec*time.Second,
+			Deadline:    vc.Incoming.SafeDeadline.Unix(),
+			Capacity:    capacity.Nano(),
+			Purpose:     ins.Purpose,
+			LatestState: last,
 		}
 
 		s.mx.Lock()
@@ -571,11 +574,10 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 	mutation()
 	v.LatestState = &st
 
-	if ins.Final && v.Active {
-		if err := s.gw.payments.Service.CloseVirtualChannel(ctx, ins.Key); err != nil {
+	if ins.Final {
+		if err := s.gw.closePaymentChannel(v); err != nil {
 			return fmt.Errorf("close virtual channel failed: %w", err)
 		}
-		v.Active = false
 	}
 
 	return nil
