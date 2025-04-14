@@ -431,13 +431,18 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 	if v == nil {
 		vc, err := s.gw.payments.Service.GetVirtualChannelMeta(ctx, ins.Key)
 		if err != nil {
-			return fmt.Errorf("get virtual channel failed: %w", err)
+			return fmt.Errorf("get virtual %x channel failed: %w", ins.Key, err)
 		}
 
 		var last *payments.VirtualChannelState
-		if ins.PaymentChannelState != nil {
+		if len(vc.LastKnownResolve) > 0 {
+			cl, err := cell.FromBOC(vc.LastKnownResolve)
+			if err != nil {
+				return fmt.Errorf("incorrect latest state cell: %w", err)
+			}
+
 			last = &payments.VirtualChannelState{}
-			if err = tlb.LoadFromCell(last, ins.PaymentChannelState.BeginParse()); err != nil {
+			if err = tlb.LoadFromCell(last, cl.BeginParse()); err != nil {
 				return fmt.Errorf("incorrect latest state cell: %w", err)
 			}
 		}
