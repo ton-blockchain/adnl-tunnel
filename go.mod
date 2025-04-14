@@ -7,7 +7,7 @@ require (
 	github.com/prometheus/client_golang v1.22.0
 	github.com/rs/zerolog v1.34.0
 	github.com/xssnick/ton-payment-network v0.0.0-20250414095146-1c3026daa18e
-	github.com/xssnick/tonutils-go v1.12.0
+	github.com/xssnick/tonutils-go v1.11.2-0.20250410181246-8f93de3479f6
 )
 
 require (
