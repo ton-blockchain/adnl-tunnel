@@ -28,10 +28,13 @@ import (
 	"github.com/xssnick/tonutils-go/ton/wallet"
 	"math/big"
 	"net"
+	"net/http"
 	"net/netip"
 	"runtime"
 	"strings"
 	"time"
+
+	_ "net/http/pprof"
 )
 
 var ConfigPath = flag.String("config", "config.json", "Config path")
@@ -58,6 +61,14 @@ func main() {
 			log.Logger.Debug().Msg(fmt.Sprintln(v...))
 		}
 	}
+
+	go func() {
+		runtime.SetBlockProfileRate(1)
+		log.Info().Msg("starting pprof server on :6060")
+		if err := http.ListenAndServe(":6065", nil); err != nil {
+			log.Fatal().Err(err).Msg("error starting pprof server")
+		}
+	}()
 
 	if *Verbosity >= 3 {
 		log.Logger = log.Logger.Level(zerolog.DebugLevel).With().Logger()
