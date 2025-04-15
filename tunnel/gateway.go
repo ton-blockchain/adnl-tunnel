@@ -364,20 +364,22 @@ func (g *Gateway) keepAlivePeersAndSections() {
 
 			g.mx.RLock()
 			for _, section := range g.inboundSections {
+				if !section.mx.TryLock() {
+					continue
+				}
+
 				if atomic.LoadInt64(&section.lastPacketAt) < tm-SectionMaxInactiveSec {
 					sectionsToClose = append(sectionsToClose, section)
 				} else {
 					for k, channel := range section.payments {
 						if channel.Active && channel.Deadline < tm {
 							paymentsToClose = append(paymentsToClose, channel)
-						}
-
-						if !channel.Active && section.mx.TryLock() {
+						} else if !channel.Active {
 							delete(section.payments, k)
-							section.mx.Unlock()
 						}
 					}
 				}
+				section.mx.Unlock()
 			}
 			g.mx.RUnlock()
 
@@ -610,10 +612,14 @@ func (g *Gateway) closePaymentChannel(ch *PaymentChannel) error {
 	ch.mx.Lock()
 	defer ch.mx.Unlock()
 
+	if !ch.Active {
+		return nil
+	}
+
 	// we mark it as inactive in any way, because it is complicated to handle closure errors and they are very unlikely
 	ch.Active = false
 
-	if !ch.Active || ch.LatestState == nil {
+	if ch.LatestState == nil {
 		return nil
 	}
 
