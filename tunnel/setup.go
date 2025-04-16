@@ -32,6 +32,10 @@ import (
 	cRand "crypto/rand"
 )
 
+var Acceptor = func(to, from []*SectionInfo) bool {
+	return true
+}
+
 func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, netCfg *liteclient.GlobalConfig, logger zerolog.Logger) (*RegularOutTunnel, uint16, net.IP, error) {
 	if len(sharedCfg.NodesPool) == 0 {
 		return nil, 0, nil, fmt.Errorf("no nodes pool provided, please specify at least one node in config file")
@@ -100,6 +104,8 @@ func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, net
 
 	logger.Info().Msg("initializing adnl tunnel...")
 
+rebuild:
+
 	var chainTo, chainFrom []*SectionInfo
 
 	var rndInt = make([]byte, 8)
@@ -157,6 +163,10 @@ func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, net
 	if len(chainFrom) > 0 && siBack != nil {
 		// we need same first node to be able to connect to users with
 		chainFrom[len(chainFrom)-1] = siBack
+	}
+
+	if !Acceptor(chainTo, chainFrom) {
+		goto rebuild
 	}
 
 	var strTo string
