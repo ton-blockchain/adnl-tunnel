@@ -63,8 +63,8 @@ func main() {
 	}
 
 	go func() {
-		runtime.SetBlockProfileRate(1)
-		log.Info().Msg("starting pprof server on :6060")
+		runtime.SetMutexProfileFraction(1)
+		log.Info().Msg("starting pprof server on :6065")
 		if err := http.ListenAndServe(":6065", nil); err != nil {
 			log.Fatal().Err(err).Msg("error starting pprof server")
 		}

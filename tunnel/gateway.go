@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"github.com/kevinms/leakybucket-go"
 	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/ton-blockchain/adnl-tunnel/metrics"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/tonpayments"
@@ -281,6 +283,7 @@ func (g *Gateway) Start() error {
 		g.mx.Lock()
 		if pe := g.activePeers[id]; pe == nil || pe.peer != client {
 			g.activePeers[id] = p
+			log.Debug().Str("peer", base64.StdEncoding.EncodeToString([]byte(id))).Msg("new peer connected")
 			client.SetCustomMessageHandler(g.messageHandler(p))
 		}
 		g.mx.Unlock()
@@ -457,7 +460,6 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 					lastPacketAt: time.Now().Unix(),
 					log: g.log.With().
 						Hex("tunnel", m.SectionPubKey).Logger(),
-					mx: sync.RWMutex{},
 				}
 				sec.log.Debug().Msg("inbound section created")
 

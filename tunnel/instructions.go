@@ -580,9 +580,16 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 	v.LatestState = &st
 
 	if ins.Final {
-		if err := s.gw.closePaymentChannel(v); err != nil {
-			return fmt.Errorf("close virtual channel failed: %w", err)
-		}
+		go func() { // it locks inside, so we close async
+			for i := 1; i <= 5; i++ {
+				if err := s.gw.closePaymentChannel(v); err != nil {
+					s.log.Warn().Err(err).Int("attempt", i).Msg("close payment channel failed")
+					time.Sleep(time.Second)
+					continue
+				}
+				break
+			}
+		}()
 	}
 
 	return nil
