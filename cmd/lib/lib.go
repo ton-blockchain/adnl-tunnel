@@ -138,9 +138,13 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 		log.Fatal().Err(err).Msg("Failed to parse tunnel config")
 	}
 
-	data, err = os.ReadFile(cfg.SharedConfigPath)
+	if cfg.NodesPoolConfigPath == "" {
+		log.Fatal().Msg("nodes pool config path is empty")
+	}
+
+	data, err = os.ReadFile(cfg.NodesPoolConfigPath)
 	if err != nil {
-		log.Fatal().Err(err).Str("path", cfg.SharedConfigPath).Msg("Failed to load tunnel shared config (nodes pool)")
+		log.Fatal().Err(err).Str("path", cfg.NodesPoolConfigPath).Msg("Failed to load tunnel shared config (nodes pool)")
 	}
 
 	var sharedCfg config.SharedConfig

@@ -64,10 +64,10 @@ type PaymentsClientConfig struct {
 }
 
 type ClientConfig struct {
-	TunnelServerKey   []byte
-	TunnelThreads     uint
-	TunnelSectionsNum uint
-	SharedConfigPath  string
+	TunnelServerKey     []byte
+	TunnelThreads       uint
+	TunnelSectionsNum   uint
+	NodesPoolConfigPath string
 
 	PaymentsEnabled bool
 	Payments        PaymentsClientConfig
@@ -324,11 +324,11 @@ func GenerateClientConfig(path string) (*ClientConfig, error) {
 	}
 
 	cfg := &ClientConfig{
-		TunnelServerKey:   tunnelPrv.Seed(),
-		TunnelThreads:     uint(runtime.NumCPU()),
-		TunnelSectionsNum: 1,
-		SharedConfigPath:  "./tunnel-nodes-pool.json",
-		PaymentsEnabled:   false,
+		TunnelServerKey:     tunnelPrv.Seed(),
+		TunnelThreads:       uint(runtime.NumCPU()),
+		TunnelSectionsNum:   1,
+		NodesPoolConfigPath: "",
+		PaymentsEnabled:     false,
 		Payments: PaymentsClientConfig{
 			ADNLServerKey:     adnlPrv.Seed(),
 			PaymentsNodeKey:   paymentsPrv.Seed(),
