@@ -123,11 +123,16 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if _, err = config.GenerateClientConfig(path); err != nil {
+			cfg, err := config.GenerateClientConfig()
+			if err != nil {
 				log.Error().Err(err).Msg("Failed to generate tunnel config")
 				os.Exit(1)
 			}
-			log.Info().Msg("Generated tunnel config; fill it with the desired route and restart")
+			if err = config.SaveConfig(cfg, path); err != nil {
+				log.Error().Err(err).Msg("Failed to save tunnel config")
+				os.Exit(1)
+			}
+			log.Info().Msg("Generated tunnel config; fill it with the desired settings and nodes pool config path, then restart")
 			os.Exit(0)
 		}
 		log.Fatal().Err(err).Msg("Failed to load tunnel config")

@@ -297,7 +297,7 @@ func LoadConfig(path string) (*Config, error) {
 	return nil, err
 }
 
-func GenerateClientConfig(path string) (*ClientConfig, error) {
+func GenerateClientConfig() (*ClientConfig, error) {
 	_, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		return nil, err
@@ -384,7 +384,7 @@ func GenerateClientConfig(path string) (*ClientConfig, error) {
 		},
 	}
 
-	return cfg, SaveConfig(cfg, path)
+	return cfg, nil
 }
 
 func GenerateSharedConfig(src *Config, path string) (*SharedConfig, error) {
