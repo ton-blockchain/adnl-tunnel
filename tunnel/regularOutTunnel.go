@@ -151,7 +151,7 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 		return nil, fmt.Errorf("register peer failed: %w", err)
 	}
 
-	closerCtx, closer := context.WithCancel(context.Background())
+	closerCtx, closer := context.WithCancel(g.closerCtx)
 	rt := &RegularOutTunnel{
 		localID:         binary.LittleEndian.Uint32(pec.SectionPubKey), // first 4 bytes
 		gateway:         g,
@@ -1082,6 +1082,8 @@ func (t *RegularOutTunnel) WaitForInit(ctx context.Context) (net.IP, uint16, err
 		select {
 		case <-ctx.Done():
 			return nil, 0, ctx.Err()
+		case <-t.closerCtx.Done():
+			return nil, 0, t.closerCtx.Err()
 		case <-t.initSignal:
 			if t.usePayments {
 				t.requestPayment()
@@ -1090,6 +1092,8 @@ func (t *RegularOutTunnel) WaitForInit(ctx context.Context) (net.IP, uint16, err
 				select {
 				case <-ctx.Done():
 					return nil, 0, ctx.Err()
+				case <-t.closerCtx.Done():
+					return nil, 0, t.closerCtx.Err()
 				case <-t.paidSignal:
 					// wait for payments to happen
 				}

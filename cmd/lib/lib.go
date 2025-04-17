@@ -45,11 +45,13 @@ import (
 	"github.com/xssnick/tonutils-go/liteclient"
 	"net"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
 
-var _gcAliveHolder []*tunnel.RegularOutTunnel
+var indexMatch []unsafe.Pointer
 
 // 16 bytes
 func writeSockAddr(at []byte, addr *net.UDPAddr) {
@@ -152,21 +154,38 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 		return C.Tunnel{}
 	}
 
-	tun, port, ip, err := tunnel.PrepareTunnel(&cfg, &sharedCfg, &netCfg, log.Logger)
-	if err != nil {
-		log.Error().Err(err).Msg("failed to prepare tunnel")
-		return C.Tunnel{}
-	}
+	events := make(chan any, 1)
+	go tunnel.RunTunnel(&cfg, &sharedCfg, &netCfg, log.Logger, events)
 
-	tun.SetOutAddressChangedHandler(func(addr *net.UDPAddr) {
-		var buf [16]byte
-		writeSockAddr(buf[:], addr)
+	indexMatch = append(indexMatch, nil)
 
-		C.on_reinit((C.RecvCallback)(onReinit), nextOnReinit, unsafe.Pointer(&buf[0]))
-	})
+	initUpd := make(chan tunnel.UpdatedEvent, 1)
+	once := sync.Once{}
+	go func() {
+		for event := range events {
+			switch e := event.(type) {
+			case tunnel.UpdatedEvent:
+				log.Info().Msg("tunnel updated")
 
-	// to not collect by gc
-	_gcAliveHolder = append(_gcAliveHolder, tun)
+				e.Tunnel.SetOutAddressChangedHandler(func(addr *net.UDPAddr) {
+					var buf [16]byte
+					writeSockAddr(buf[:], addr)
+
+					C.on_reinit((C.RecvCallback)(onReinit), nextOnReinit, unsafe.Pointer(&buf[0]))
+				})
+
+				once.Do(func() {
+					initUpd <- e
+				})
+
+				atomic.StorePointer(&indexMatch[0], unsafe.Pointer(e.Tunnel))
+			case tunnel.ConfigurationErrorEvent:
+				log.Err(e.Err).Msg("tunnel configuration error, will retry...")
+			case error:
+				log.Fatal().Err(e).Msg("tunnel failed")
+			}
+		}
+	}()
 
 	go func() {
 		off, num := 0, 0
@@ -175,6 +194,7 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 		ctx, _ := context.WithTimeout(context.Background(), 20*time.Millisecond)
 
 		for {
+			tun := (*tunnel.RegularOutTunnel)(atomic.LoadPointer(&indexMatch[0]))
 			n, addr, err := tun.ReadFromWithTimeout(ctx, buf[off+18:])
 			if err != nil {
 				if !errors.Is(err, context.DeadlineExceeded) {
@@ -209,23 +229,24 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 		}
 	}()
 
-	log.Info().Uint16("port", port).IPAddr("ip", ip).Msg("using tunnel")
+	upd := <-initUpd
+	log.Info().Uint16("port", upd.ExtPort).IPAddr("ip", upd.ExtIP).Msg("using tunnel")
 	return C.Tunnel{
-		index: C.size_t(len(_gcAliveHolder)),
-		ip:    C.int(binary.BigEndian.Uint32(ip.To4())),
-		port:  C.int(port),
+		index: C.size_t(len(indexMatch)),
+		ip:    C.int(binary.BigEndian.Uint32(upd.ExtIP.To4())),
+		port:  C.int(upd.ExtPort),
 	}
 }
 
 //export WriteTunnel
 func WriteTunnel(tunIdx C.size_t, data *C.uint8_t, num C.size_t) C.int {
-	if int(tunIdx) <= 0 || int(tunIdx) > len(_gcAliveHolder) {
+	if int(tunIdx) <= 0 || int(tunIdx) > len(indexMatch) {
 		return 0
 	}
 
 	// log.Debug().Int("num", int(num)).Msg("batch write to tunnel")
 
-	tun := _gcAliveHolder[int(tunIdx)-1]
+	tun := (*tunnel.RegularOutTunnel)(atomic.LoadPointer(&indexMatch[int(tunIdx)-1]))
 
 	// convert to go slice but without copy, we don't cate about actual len so set it big
 	buf := unsafe.Slice((*byte)(unsafe.Pointer(data)), 1<<31)

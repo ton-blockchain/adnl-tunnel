@@ -36,59 +36,95 @@ var Acceptor = func(to, from []*SectionInfo) bool {
 	return true
 }
 
-func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, netCfg *liteclient.GlobalConfig, logger zerolog.Logger) (*RegularOutTunnel, uint16, net.IP, error) {
-	if len(sharedCfg.NodesPool) == 0 {
-		return nil, 0, nil, fmt.Errorf("no nodes pool provided, please specify at least one node in config file")
+var AskReroute = func() bool {
+	return false
+}
+
+type UpdatedEvent struct {
+	Tunnel  *RegularOutTunnel
+	ExtIP   net.IP
+	ExtPort uint16
+}
+
+type ConfigurationErrorEvent struct {
+	Err error
+}
+
+func RunTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, netCfg *liteclient.GlobalConfig, logger zerolog.Logger, events chan any) {
+	var nodes []config.TunnelRouteSection
+
+	if !cfg.PaymentsEnabled {
+		for i, section := range sharedCfg.NodesPool {
+			if section.Payment == nil {
+				nodes = append(nodes, sharedCfg.NodesPool[i])
+			}
+		}
+	} else {
+		nodes = sharedCfg.NodesPool
 	}
 
-	if uint(len(sharedCfg.NodesPool)) < cfg.TunnelSectionsNum {
-		return nil, 0, nil, fmt.Errorf("not enough nodes in pool to have desired tunnel sections number")
+	if len(nodes) == 0 {
+		events <- fmt.Errorf("no nodes pool provided, please specify at least one node that match your payment settings in config file")
+		return
+	}
+
+	if uint(len(nodes)) < cfg.TunnelSectionsNum {
+		events <- fmt.Errorf("not enough nodes that match your payment settings in pool to have desired tunnel sections number")
+		return
 	}
 
 	_, dhtKey, err := ed25519.GenerateKey(nil)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("failed to generate DHT key: %w", err)
+		events <- fmt.Errorf("failed to generate DHT key: %w", err)
+		return
 	}
 
 	_, tunKey, err := ed25519.GenerateKey(nil)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("failed to generate TUN key: %w", err)
+		events <- fmt.Errorf("failed to generate TUN key: %w", err)
+		return
 	}
 
 	conn, err := adnl.DefaultListener(":")
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("failed to bind listener: %w", err)
+		events <- fmt.Errorf("failed to bind listener: %w", err)
+		return
 	}
 
 	ml := adnl.NewMultiNetReader(conn)
 
 	gate := adnl.NewGatewayWithNetManager(tunKey, ml)
 	if err = gate.StartClient(8); err != nil {
-		return nil, 0, nil, fmt.Errorf("start gateway as client failed: %w", err)
+		events <- fmt.Errorf("start gateway as client failed: %w", err)
+		return
 	}
 
 	dhtGate := adnl.NewGatewayWithNetManager(dhtKey, ml)
 	if err = dhtGate.StartClient(); err != nil {
-		return nil, 0, nil, fmt.Errorf("start dht gateway failed: %w", err)
+		events <- fmt.Errorf("start dht gateway failed: %w", err)
+		return
 	}
 
 	dhtClient, err := dht.NewClientFromConfig(dhtGate, netCfg)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("failed to create DHT client: %w", err)
+		events <- fmt.Errorf("failed to create DHT client: %w", err)
+		return
 	}
 
 	var pay *tonpayments.Service
 	if cfg.PaymentsEnabled {
 		lsClient := liteclient.NewConnectionPool()
 		if err := lsClient.AddConnectionsFromConfig(context.Background(), netCfg); err != nil {
-			return nil, 0, nil, fmt.Errorf("failed to connect to liteservers: %w", err)
+			events <- fmt.Errorf("failed to connect to liteservers: %w", err)
+			return
 		}
 
 		apiClient := ton.NewAPIClient(lsClient, ton.ProofCheckPolicyFast).WithRetry().WithTimeout(10 * time.Second)
 
 		pay, err = preparePayerPayments(context.Background(), apiClient, dhtClient, cfg, sharedCfg, logger, ml)
 		if err != nil {
-			return nil, 0, nil, fmt.Errorf("prepare payments failed: %w", err)
+			events <- fmt.Errorf("prepare payments failed: %w", err)
+			return
 		}
 	}
 
@@ -97,42 +133,97 @@ func PrepareTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, net
 	})
 	go func() {
 		if err = tGate.Start(); err != nil {
-			log.Fatal().Err(err).Msg("tunnel gateway failed")
+			events <- fmt.Errorf("tunnel gateway failed: %w", err)
 			return
 		}
 	}()
 
-	logger.Info().Msg("initializing adnl tunnel...")
+	attempts := map[string]bool{}
+reinit:
+	for {
+		var lastAsk int64
+		ctxInit, cancel := context.WithTimeout(tGate.closerCtx, 60*time.Second)
+		tun, port, ip, err, retryable := configureRoute(ctxInit, cfg, tGate, nodes, attempts)
+		cancel()
+		if err != nil {
+			if !retryable {
+				events <- fmt.Errorf("failed to configure route: %w", err)
+				return
+			}
 
-rebuild:
+			events <- ConfigurationErrorEvent{err}
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+
+		events <- UpdatedEvent{
+			Tunnel:  tun,
+			ExtIP:   ip,
+			ExtPort: port,
+		}
+
+		for {
+			select {
+			case <-tGate.closerCtx.Done():
+				return
+			case <-time.After(5 * time.Second):
+				now := time.Now().Unix()
+				if tun.lastFullyCheckedAt-now > 90 && now-lastAsk > 60 {
+					tGate.log.Warn().Msg("tunnel is stalled for too long, asking about rerouting...")
+					if AskReroute() {
+						_ = tun.Close()
+						continue reinit
+					} else {
+						tGate.log.Warn().Msg("rerouting denied, waiting 60 seconds before next ask")
+
+						lastAsk = time.Now().Unix()
+					}
+				}
+			}
+		}
+	}
+}
+
+var ErrRouteIsNotAccepted = errors.New("route is not accepted")
+
+func configureRoute(ctx context.Context, cfg *config.ClientConfig, tGate *Gateway, nodes []config.TunnelRouteSection, attempts map[string]bool) (*RegularOutTunnel, uint16, net.IP, error, bool) {
+	tGate.log.Info().Msg("initializing adnl tunnel...")
+
+	var tries int
+reassemble:
+	if tries > 50 {
+		return nil, 0, nil, fmt.Errorf("failed to find unique route after 50 attempts"), false
+	}
+
+	tries++
 
 	var chainTo, chainFrom []*SectionInfo
 
 	var rndInt = make([]byte, 8)
-	if _, err = cRand.Read(rndInt); err != nil {
-		return nil, 0, nil, fmt.Errorf("failed to generate random number: %w", err)
+	if _, err := cRand.Read(rndInt); err != nil {
+		return nil, 0, nil, fmt.Errorf("failed to generate random number: %w", err), false
 	}
 	rnd := rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(rndInt))))
 
-	rnd.Shuffle(len(sharedCfg.NodesPool), func(i, j int) {
-		sharedCfg.NodesPool[i], sharedCfg.NodesPool[j] = sharedCfg.NodesPool[j], sharedCfg.NodesPool[i]
+	rnd.Shuffle(len(nodes), func(i, j int) {
+		nodes[i], nodes[j] = nodes[j], nodes[i]
 	})
 
-	out := sharedCfg.NodesPool[0]
-	pool := sharedCfg.NodesPool[1:]
+	out := nodes[0]
+	pool := nodes[1:]
 
 	var siBack *SectionInfo
 	if cfg.TunnelSectionsNum > 1 {
 		for i := uint(0); i < cfg.TunnelSectionsNum-1; i++ {
-			si, err := paymentConfigToSections(&pool[i], false, pay)
+			si, err := paymentConfigToSections(&pool[i], false, tGate.payments.Service)
 			if err != nil {
-				return nil, 0, nil, fmt.Errorf("convert config to section %d in `out` route failed: %w", i, err)
+				return nil, 0, nil, fmt.Errorf("convert config to section %d in `out` route failed: %w", i, err), false
 			}
 
 			if siBack == nil {
-				siBack, err = paymentConfigToSections(&pool[i], false, pay)
+				siBack, err = paymentConfigToSections(&pool[i], false, tGate.payments.Service)
 				if err != nil {
-					return nil, 0, nil, fmt.Errorf("convert config to section %d in `out` route failed: %w", i, err)
+					return nil, 0, nil, fmt.Errorf("convert config to section %d in `out` route failed: %w", i, err), false
 				}
 			}
 
@@ -144,18 +235,18 @@ rebuild:
 		})
 
 		for i := uint(0); i < cfg.TunnelSectionsNum-1; i++ {
-			si, err := paymentConfigToSections(&pool[i], false, pay)
+			si, err := paymentConfigToSections(&pool[i], false, tGate.payments.Service)
 			if err != nil {
-				return nil, 0, nil, fmt.Errorf("convert config to section %d in `in` route failed: %w", i, err)
+				return nil, 0, nil, fmt.Errorf("convert config to section %d in `in` route failed: %w", i, err), false
 			}
 
 			chainFrom = append(chainFrom, si)
 		}
 	}
 
-	siGate, err := paymentConfigToSections(&out, true, pay)
+	siGate, err := paymentConfigToSections(&out, true, tGate.payments.Service)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("convert config to section out gateway failed: %w", err)
+		return nil, 0, nil, fmt.Errorf("convert config to section out gateway failed: %w", err), false
 	}
 
 	chainTo = append(chainTo, siGate)
@@ -163,10 +254,6 @@ rebuild:
 	if len(chainFrom) > 0 && siBack != nil {
 		// we need same first node to be able to connect to users with
 		chainFrom[len(chainFrom)-1] = siBack
-	}
-
-	if !Acceptor(chainTo, chainFrom) {
-		goto rebuild
 	}
 
 	var strTo string
@@ -180,31 +267,42 @@ rebuild:
 	}
 	strTo += "we"
 
-	logger.Info().Str("route", strTo).Msgf("configuring route...")
+	if attempts[strTo] {
+		goto reassemble
+	}
 
-	toUs, err := GenerateEncryptionKeys(tunKey.Public().(ed25519.PublicKey))
+	tGate.log.Info().Str("route", strTo).Msgf("configuring route...")
+
+	attempts[strTo] = true
+	if !Acceptor(chainTo, chainFrom) {
+		tGate.log.Info().Str("route", strTo).Msgf("route denied")
+
+		return nil, 0, nil, ErrRouteIsNotAccepted, true
+	}
+
+	toUs, err := GenerateEncryptionKeys(tGate.key.Public().(ed25519.PublicKey))
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("generate us encryption keys failed: %w", err)
+		return nil, 0, nil, fmt.Errorf("generate us encryption keys failed: %w", err), false
 	}
 	chainFrom = append(chainFrom, &SectionInfo{
 		Keys: toUs,
 	})
 
-	tun, err := tGate.CreateRegularOutTunnel(context.Background(), chainTo, chainFrom, logger.With().Str("component", "tunnel").Logger())
+	tun, err := tGate.CreateRegularOutTunnel(ctx, chainTo, chainFrom, tGate.log.With().Str("component", "tunnel").Logger())
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("create regular out tunnel failed: %w", err)
+		return nil, 0, nil, fmt.Errorf("create regular out tunnel failed: %w", err), true
 	}
 
-	logger.Info().Msg("waiting adnl tunnel confirmation...")
+	tGate.log.Info().Str("route", strTo).Msg("waiting adnl tunnel confirmation...")
 
-	extIP, extPort, err := tun.WaitForInit(context.Background())
+	extIP, extPort, err := tun.WaitForInit(ctx)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("wait for tunnel init failed: %w", err)
+		return nil, 0, nil, fmt.Errorf("wait for tunnel init failed: %w", err), true
 	}
 
-	logger.Info().Msg("adnl tunnel is ready")
+	tGate.log.Info().Str("route", strTo).Msg("adnl tunnel is ready")
 
-	return tun, extPort, extIP, nil
+	return tun, extPort, extIP, nil, true
 }
 
 func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, dhtClient *dht.Client, cfg *config.ClientConfig, sharedCfg *config.SharedConfig, logger zerolog.Logger, manager adnl.NetManager) (*tonpayments.Service, error) {
