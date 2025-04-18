@@ -6,8 +6,8 @@ require (
 	github.com/kevinms/leakybucket-go v0.0.0-20200115003610-082473db97ca
 	github.com/prometheus/client_golang v1.22.0
 	github.com/rs/zerolog v1.34.0
-	github.com/xssnick/ton-payment-network v0.0.0-20250415171941-548f60253c87
-	github.com/xssnick/tonutils-go v1.11.2-0.20250410181246-8f93de3479f6
+	github.com/xssnick/ton-payment-network v0.0.0-20250418111332-2c4ae943677c
+	github.com/xssnick/tonutils-go v1.11.2-0.20250418105758-7783ad538f9b
 )
 
 require (

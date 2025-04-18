@@ -253,7 +253,20 @@ reassemble:
 
 	if len(chainFrom) > 0 && siBack != nil {
 		// we need same first node to be able to connect to users with
-		chainFrom[len(chainFrom)-1] = siBack
+		found := false
+		for i, node := range chainFrom {
+			if bytes.Equal(node.Keys.ReceiverPubKey, siBack.Keys.ReceiverPubKey) {
+				// swap the found node with the last node in the chainFrom
+				chainFrom[i], chainFrom[len(chainFrom)-1] = chainFrom[len(chainFrom)-1], node
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			// not there, replace last with it
+			chainFrom[len(chainFrom)-1] = siBack
+		}
 	}
 
 	var strTo string
