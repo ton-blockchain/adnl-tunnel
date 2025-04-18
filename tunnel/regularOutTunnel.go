@@ -54,6 +54,9 @@ type Payer struct {
 
 	PaidPackets    int64
 	CurrentChannel *VirtualPaymentChannel
+	PaidChannelFee *big.Int
+
+	feeMx sync.RWMutex
 }
 
 type SectionInfo struct {
@@ -493,6 +496,11 @@ func (t *RegularOutTunnel) CalcPaidAmount() map[string]tlb.Coins {
 		}
 
 		amt := new(big.Int).Mul(new(big.Int).SetInt64(section.PaymentInfo.PaidPackets), new(big.Int).SetUint64(section.PaymentInfo.PricePerPacket))
+
+		section.PaymentInfo.feeMx.RLock()
+		amt = amt.Add(amt, section.PaymentInfo.PaidChannelFee)
+		section.PaymentInfo.feeMx.RUnlock()
+
 		paidAmount[cc.Symbol] = tlb.MustFromNano(new(big.Int).Add(paidAmount[cc.Symbol].Nano(), amt), int(cc.Decimals))
 	}
 
@@ -544,6 +552,13 @@ func (t *RegularOutTunnel) openVirtualChannel(p *Payer, capacity *big.Int) (*Vir
 		}
 		break
 	}
+
+	p.feeMx.Lock()
+	if p.PaidChannelFee == nil {
+		p.PaidChannelFee = big.NewInt(0)
+	}
+	p.PaidChannelFee.Add(p.PaidChannelFee, tunChain[0].Fee)
+	p.feeMx.Unlock()
 
 	return &VirtualPaymentChannel{
 		Key:        chKey,
