@@ -467,6 +467,34 @@ func (t *RegularOutTunnel) buildTunnelPaymentsChain(paymentTunnel []PaymentTunne
 	return chain, nil
 }
 
+func (t *RegularOutTunnel) CalcPaidAmount() map[string]tlb.Coins {
+	t.mx.RLock()
+	defer t.mx.RUnlock()
+
+	paidAmount := make(map[string]tlb.Coins)
+
+	for _, section := range append(t.chainTo, t.chainFrom...) {
+		if section.PaymentInfo == nil {
+			continue
+		}
+
+		var jm string
+		if section.PaymentInfo.JettonMaster != nil {
+			jm = section.PaymentInfo.JettonMaster.String()
+		}
+
+		cc, err := t.gateway.payments.Service.ResolveCoinConfig(jm, section.PaymentInfo.ExtraCurrencyID, true)
+		if err != nil {
+			continue
+		}
+
+		amt := new(big.Int).Mul(new(big.Int).SetInt64(section.PaymentInfo.PaidPackets), new(big.Int).SetUint64(section.PaymentInfo.PricePerPacket))
+		paidAmount[cc.Symbol] = tlb.MustFromNano(new(big.Int).Add(paidAmount[cc.Symbol].Nano(), amt), int(cc.Decimals))
+	}
+
+	return paidAmount
+}
+
 func (t *RegularOutTunnel) openVirtualChannel(p *Payer, capacity *big.Int) (*VirtualPaymentChannel, error) {
 	t.log.Debug().Uint64("price_per_packet", p.PricePerPacket).Str("capacity", tlb.FromNanoTON(capacity).String()).Msg("opening virtual channel")
 	var tunChain = make([]transport.TunnelChainPart, len(p.PaymentTunnel))
