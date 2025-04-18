@@ -467,6 +467,10 @@ func (t *RegularOutTunnel) buildTunnelPaymentsChain(paymentTunnel []PaymentTunne
 	return chain, nil
 }
 
+func (t *RegularOutTunnel) AliveCtx() context.Context {
+	return t.closerCtx
+}
+
 func (t *RegularOutTunnel) CalcPaidAmount() map[string]tlb.Coins {
 	t.mx.RLock()
 	defer t.mx.RUnlock()
