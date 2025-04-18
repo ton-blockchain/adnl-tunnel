@@ -127,6 +127,9 @@ type RegularOutTunnel struct {
 
 var initAddr = net.UDPAddrFromAddrPort(netip.MustParseAddrPort("0.0.0.1:123"))
 
+var ChannelCapacityForNumPayments int64 = 30
+var ChannelPacketsToPrepay int64 = 200000
+
 func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom []*SectionInfo, log zerolog.Logger) (*RegularOutTunnel, error) {
 	if len(chainTo) == 0 || len(chainFrom) == 0 {
 		return nil, fmt.Errorf("chains should have at least one node")
@@ -171,7 +174,7 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 		log:             log,
 		closerCtx:       closerCtx,
 		close:           closer,
-		packetsToPrepay: 200000,
+		packetsToPrepay: ChannelPacketsToPrepay,
 	}
 
 	list := append([]*SectionInfo{}, chainTo...)
@@ -567,8 +570,6 @@ func (t *RegularOutTunnel) openVirtualChannel(p *Payer, capacity *big.Int) (*Vir
 		Deadline:   tunChain[len(tunChain)-1].Deadline,
 	}, nil
 }
-
-const ChannelCapacityForNumPayments = 30
 
 func (t *RegularOutTunnel) prepareTunnelPings() (*EncryptedMessage, error) {
 	t.mx.Lock()
