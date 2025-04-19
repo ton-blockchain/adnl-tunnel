@@ -166,7 +166,7 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 	events := make(chan any, 1)
 	go tunnel.RunTunnel(&cfg, &sharedCfg, &netCfg, log.Logger, events)
 
-	indexMatch = append(indexMatch, nil)
+	indexMatch = []unsafe.Pointer{nil}
 
 	initUpd := make(chan tunnel.UpdatedEvent, 1)
 	once := sync.Once{}
@@ -195,6 +195,7 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 			}
 		}
 	}()
+	upd := <-initUpd
 
 	go func() {
 		off, num := 0, 0
@@ -238,7 +239,6 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 		}
 	}()
 
-	upd := <-initUpd
 	log.Info().Uint16("port", upd.ExtPort).IPAddr("ip", upd.ExtIP).Msg("using tunnel")
 	return C.Tunnel{
 		index: C.size_t(len(indexMatch)),

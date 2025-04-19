@@ -368,7 +368,7 @@ func (t *RegularOutTunnel) startSystemSender() {
 					continue
 				}
 				lastPaymentMsg = lastMsg
-			} else {
+			} else if lastPaymentMsg != nil {
 				msg, err := t.ReassembleInstructions(lastPaymentMsg)
 				if err != nil {
 					t.log.Error().Err(err).Msg("reassemble instructions failed")
