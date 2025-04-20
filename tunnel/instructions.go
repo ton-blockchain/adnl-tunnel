@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"github.com/kevinms/leakybucket-go"
@@ -272,6 +273,7 @@ func (ins BuildRouteInstruction) Execute(ctx context.Context, s *Section, msg *E
 		return fmt.Errorf("too low price per packet route: %d, min is %d", ins.PricePerPacket, s.gw.payments.MinPricePerPacketRoute)
 	}
 
+	// TODO: async?
 	peer, err := s.gw.discoverPeer(ctx, ins.TargetADNL)
 	if err != nil {
 		return fmt.Errorf("add peer for route failed: %w", err)
@@ -300,13 +302,23 @@ func (ins BuildRouteInstruction) Execute(ctx context.Context, s *Section, msg *E
 		}
 		s.routes[ins.RouteID] = route
 	} else {
+		if existingTarget := (*RouteTarget)(atomic.LoadPointer(&route.Target)); existingTarget != nil &&
+			bytes.Equal(existingTarget.ADNL, target.ADNL) &&
+			bytes.Equal(existingTarget.SectionKey, target.SectionKey) &&
+			existingTarget.PricePerPacket == target.PricePerPacket {
+			// it is same
+			return nil
+		}
+
 		atomic.StorePointer(&route.Target, unsafe.Pointer(target))
 	}
 
-	s.log.Debug().
-		Str("peer", peer.peer.RemoteAddr()).
-		Hex("target_key", ins.TargetSectionPubKey).
-		Hex("target_adnl", ins.TargetADNL).
+	s.log.Info().
+		Uint32("id", ins.RouteID).
+		Str("target_addr", peer.peer.RemoteAddr()).
+		Str("target_key", base64.StdEncoding.EncodeToString(ins.TargetSectionPubKey)).
+		Str("target_adnl", base64.StdEncoding.EncodeToString(ins.TargetADNL)).
+		Uint64("price_per_packet", ins.PricePerPacket).
 		Msg("route configured")
 
 	return nil
@@ -659,6 +671,7 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		ins.PricePerPacket = 0
 	}
 
+	var port uint16
 	if s.out == nil {
 		// allocate port automatically
 		conn, err := net.ListenPacket("udp", ":0")
@@ -685,6 +698,13 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 
 		go s.out.Listen(s.gw, 8)
 		atomic.AddUint64(&peer.references, 1)
+
+		port = uint16(s.out.conn.LocalAddr().(*net.UDPAddr).Port)
+		s.log.Info().
+			Str("from_addr", peer.peer.RemoteAddr()).
+			Uint16("alloc_port", port).
+			Str("back_route_adnl", base64.StdEncoding.EncodeToString(ins.InboundNodeADNL)).
+			Msg("out addr allocated")
 	} else {
 		s.out.mx.Lock()
 		s.out.InboundADNL = ins.InboundNodeADNL
@@ -694,16 +714,16 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		s.out.Instructions = ins.InboundInstructions
 		s.out.PricePerPacket = new(big.Int).SetUint64(ins.PricePerPacket)
 		s.out.mx.Unlock()
+
+		port = uint16(s.out.conn.LocalAddr().(*net.UDPAddr).Port)
+
+		s.log.Info().
+			Str("peer", peer.peer.RemoteAddr()).
+			Uint16("port", port).
+			Str("back_route_adnl", base64.StdEncoding.EncodeToString(ins.InboundNodeADNL)).
+			Int("size", len(ins.InboundInstructions)).
+			Msg("out addr reconfigured")
 	}
-
-	port := uint16(s.out.conn.LocalAddr().(*net.UDPAddr).Port)
-
-	s.log.Debug().
-		Str("peer", peer.peer.RemoteAddr()).
-		Uint16("port", port).
-		Hex("target_adnl", ins.InboundNodeADNL).
-		Int("size", len(ins.InboundInstructions)).
-		Msg("inbound route configured")
 
 	if err = s.out.sendBack(OutBindDonePayload{
 		Seqno: atomic.AddUint64(&s.out.PacketsSentIn, 1),

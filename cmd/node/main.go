@@ -43,18 +43,22 @@ var PaymentNodeWith = flag.String("payment-node", "", "Payment node to open chan
 var Verbosity = flag.Int("v", 2, "verbosity")
 var GenerateSharedExample = flag.String("gen-shared-config", "", "Will generate shared config file with current node, at specified path")
 
-func init() {
-	flag.Parse()
-}
+var LogFilename = flag.String("log-filename", "tunnel.log", "log file name")
+var LogMaxSize = flag.Int("log-max-size", 1024, "maximum log file size in MB before rotation")
+var LogMaxBackups = flag.Int("log-max-backups", 16, "maximum number of old log files to keep")
+var LogMaxAge = flag.Int("log-max-age", 180, "maximum number of days to retain old log files")
+var LogCompress = flag.Bool("log-compress", false, "whether to compress rotated log files")
 
 func main() {
+	flag.Parse()
+
 	// logs rotation
 	logWriter := &lumberjack.Logger{
-		Filename:   "tunnel.log",
-		MaxSize:    1024, // mb
-		MaxBackups: 16,
-		MaxAge:     180, // days
-		Compress:   false,
+		Filename:   *LogFilename,
+		MaxSize:    *LogMaxSize, // mb
+		MaxBackups: *LogMaxBackups,
+		MaxAge:     *LogMaxAge, // days
+		Compress:   *LogCompress,
 	}
 
 	multi := zerolog.MultiLevelWriter(zerolog.NewConsoleWriter(), logWriter)

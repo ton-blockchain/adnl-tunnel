@@ -459,9 +459,11 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 					payments:     map[string]*PaymentChannel{},
 					lastPacketAt: time.Now().Unix(),
 					log: g.log.With().
-						Hex("tunnel", m.SectionPubKey).Logger(),
+						Str("from_addr", peer.peer.RemoteAddr()).
+						Str("from_adnl", base64.StdEncoding.EncodeToString(peer.peer.GetID())).
+						Str("tunnel", base64.StdEncoding.EncodeToString(m.SectionPubKey)).Logger(),
 				}
-				sec.log.Debug().Msg("inbound section created")
+				sec.log.Info().Msg("inbound section created")
 
 				g.mx.Lock()
 				g.inboundSections[string(m.SectionPubKey)] = sec
