@@ -625,6 +625,8 @@ func (g *Gateway) closePaymentChannel(ch *PaymentChannel) error {
 		return nil
 	}
 
+	log.Info().Str("amount", ch.LatestState.Amount.String()).
+		Str("key", base64.StdEncoding.EncodeToString(ch.Key)).Msg("closing payment channel")
 	if err := g.payments.Service.CloseVirtualChannel(context.Background(), ch.Key); err != nil {
 		g.log.Warn().Err(err).Hex("key", ch.Key).Msg("failed to close virtual payment channel")
 	}

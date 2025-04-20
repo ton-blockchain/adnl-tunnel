@@ -505,7 +505,8 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		return fmt.Errorf("payment channel is inactive")
 	}
 
-	if v.Deadline-time.Now().Unix() < MinChannelTimeoutSec {
+	timeLeft := v.Deadline - time.Now().Unix()
+	if timeLeft < MinChannelTimeoutSec {
 		return fmt.Errorf("payment channel deadline is too short")
 	}
 
@@ -535,7 +536,12 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			x := addPrepaid(&out.PrepaidPacketsOut, num)
 			z := addPrepaid(&out.PrepaidPacketsIn, num)
 			out.mx.RUnlock()
-			s.log.Debug().Int64("num", num.Int64()).Int64("out_balance", x).Int64("in_balance", z).Str("payment", st.Amount.String()).Msg("packets prepaid for out gateway")
+			s.log.Debug().Int64("num", num.Int64()).
+				Int64("out_balance", x).
+				Int64("in_balance", z).
+				Str("payment", st.Amount.String()).
+				Int64("payment_ttl_left", timeLeft).
+				Msg("packets prepaid for out gateway")
 		}
 
 	case PaymentPurposeRoute:
@@ -565,7 +571,12 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		mutation = func() {
 			route.PaymentReceived = true
 			x := addPrepaid(&route.PrepaidPackets, num)
-			s.log.Debug().Uint32("route", routeId).Int64("num", num.Int64()).Int64("balance", x).Str("payment", st.Amount.String()).Msg("packets prepaid for route")
+			s.log.Debug().Uint32("route", routeId).
+				Int64("num", num.Int64()).
+				Int64("balance", x).
+				Str("payment", st.Amount.String()).
+				Int64("payment_ttl_left", timeLeft).
+				Msg("packets prepaid for route")
 		}
 	default:
 		return fmt.Errorf("unknown payment purpose: %d", v.Purpose>>32)

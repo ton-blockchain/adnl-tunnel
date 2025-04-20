@@ -33,10 +33,10 @@ const (
 )
 
 type VirtualPaymentChannel struct {
-	Key        ed25519.PrivateKey
-	LastAmount *big.Int
-	Capacity   *big.Int
-	Deadline   time.Time
+	Key          ed25519.PrivateKey
+	LastAmount   *big.Int
+	Capacity     *big.Int
+	SafeDeadline time.Time
 }
 
 type PaymentTunnelSection struct {
@@ -293,6 +293,7 @@ func (t *RegularOutTunnel) startSystemSender() {
 		lastTry = time.Now()
 
 		var lastMsg *EncryptedMessage
+		var paymentDeadline time.Time
 
 		lastMetaAt := atomic.LoadInt64(&t.lastFullyCheckedAt)
 		if lastMetaAt+int64((CheckEvery/time.Second)/2)*3 < time.Now().Unix() {
@@ -351,7 +352,7 @@ func (t *RegularOutTunnel) startSystemSender() {
 			received := atomic.LoadUint64(&t.packetsRecv)
 			paidUsed := atomic.LoadUint64(&t.packetsRecvPaidConsumed)
 
-			if t.paymentSeqnoReceived >= t.paymentSeqno {
+			if t.paymentSeqnoReceived >= t.paymentSeqno || paymentDeadline.Before(time.Now()) {
 				// we're paying for seqno, because packets arrive asynchronously, and we cannot know what is lost on the way
 				// so we trust seqno here, but validating it against received packets num, we agree for up to 33% loss
 				// if loss is higher we cannot trust this tunnel and will notify user and stop payments until normalization
@@ -362,7 +363,7 @@ func (t *RegularOutTunnel) startSystemSender() {
 					continue
 				}
 
-				lastMsg, err = t.prepareTunnelPayments()
+				lastMsg, paymentDeadline, err = t.prepareTunnelPayments()
 				if err != nil {
 					t.log.Error().Err(err).Msg("prepare tunnel payments failed")
 					continue
@@ -564,10 +565,10 @@ func (t *RegularOutTunnel) openVirtualChannel(p *Payer, capacity *big.Int) (*Vir
 	p.feeMx.Unlock()
 
 	return &VirtualPaymentChannel{
-		Key:        chKey,
-		LastAmount: big.NewInt(0),
-		Capacity:   tunChain[len(tunChain)-1].Capacity,
-		Deadline:   tunChain[len(tunChain)-1].Deadline,
+		Key:          chKey,
+		LastAmount:   big.NewInt(0),
+		Capacity:     tunChain[len(tunChain)-1].Capacity,
+		SafeDeadline: tunChain[len(tunChain)-1].Deadline.Add(-hopTTL),
 	}, nil
 }
 
@@ -727,7 +728,7 @@ func (t *RegularOutTunnel) reassembleInstructions(msg *EncryptedMessage) (*Encry
 	return newMsg, nil
 }
 
-func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
+func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, time.Time, error) {
 	t.mx.Lock()
 	defer t.mx.Unlock()
 
@@ -756,7 +757,7 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 					Seqno: t.paymentSeqno + 1,
 				},
 			}); err != nil {
-				return nil, fmt.Errorf("encrypt failed: %w", err)
+				return nil, time.Time{}, fmt.Errorf("encrypt failed: %w", err)
 			}
 			continue
 		}
@@ -778,7 +779,7 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 
 			if prepay > t.packetsToPrepay/2 {
 				price := new(big.Int).SetUint64(p.PricePerPacket)
-				if p.CurrentChannel == nil {
+				if p.CurrentChannel == nil || p.CurrentChannel.SafeDeadline.Before(time.Now()) {
 					regularAmount := new(big.Int).Mul(big.NewInt(t.packetsToPrepay), price)
 					// make capacity enough for ChannelCapacityForNumPayments payments,
 					// but in fact it can be less if intermediate nodes not allow this amount
@@ -786,7 +787,7 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 
 					var err error
 					if p.CurrentChannel, err = t.openVirtualChannel(p, wantCap); err != nil {
-						return nil, fmt.Errorf("open virtual channel failed: %w", err)
+						return nil, time.Time{}, fmt.Errorf("open virtual channel failed: %w", err)
 					}
 				}
 
@@ -815,7 +816,7 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 
 				pcs, err := tlb.ToCell(st)
 				if err != nil {
-					return nil, fmt.Errorf("state to cell failed: %w", err)
+					return nil, time.Time{}, fmt.Errorf("state to cell failed: %w", err)
 				}
 
 				pi := PaymentInstruction{
@@ -853,14 +854,14 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 		})
 
 		if err := nodes[i].Keys.EncryptInstructionsMessage(msg, instructions...); err != nil {
-			return nil, fmt.Errorf("encrypt failed: %w", err)
+			return nil, time.Time{}, fmt.Errorf("encrypt failed: %w", err)
 		}
 	}
 
 	if len(mutations) == 0 {
 		t.log.Debug().Msg("payments not needed")
 
-		return nil, nil
+		return nil, time.Time{}, nil
 	}
 
 	t.paymentSeqno++
@@ -868,6 +869,7 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 		mutation()
 	}
 
+	var minDeadline time.Time
 	var minPaidIn, minPaidOut int64 = math.MaxInt64, math.MaxInt64
 	for i, node := range nodes {
 		if i == len(nodes)-1 {
@@ -877,6 +879,11 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 
 		if node.PaymentInfo == nil {
 			continue
+		}
+
+		if node.PaymentInfo.CurrentChannel != nil &&
+			(minDeadline.IsZero() || node.PaymentInfo.CurrentChannel.SafeDeadline.Before(minDeadline)) {
+			minDeadline = node.PaymentInfo.CurrentChannel.SafeDeadline
 		}
 
 		if i >= len(t.chainTo) {
@@ -909,7 +916,7 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, error) {
 		t.requestPayment()
 	}
 
-	return msg, nil
+	return msg, minDeadline, nil
 }
 
 func (t *RegularOutTunnel) prepareInstructions(state uint32) error {

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/natefinch/lumberjack"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/ton-blockchain/adnl-tunnel/config"
@@ -47,7 +48,18 @@ func init() {
 }
 
 func main() {
-	log.Logger = zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger().Level(zerolog.InfoLevel)
+	// logs rotation
+	logWriter := &lumberjack.Logger{
+		Filename:   "tunnel.log",
+		MaxSize:    1024, // mb
+		MaxBackups: 16,
+		MaxAge:     180, // days
+		Compress:   false,
+	}
+
+	multi := zerolog.MultiLevelWriter(zerolog.NewConsoleWriter(), logWriter)
+
+	log.Logger = zerolog.New(multi).With().Timestamp().Logger().Level(zerolog.InfoLevel)
 	adnl.Logger = func(v ...any) {}
 
 	if *Verbosity >= 5 {
