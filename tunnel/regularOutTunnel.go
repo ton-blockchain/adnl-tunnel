@@ -1131,7 +1131,7 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 	}
 }
 
-func (t *RegularOutTunnel) WaitForInit(ctx context.Context) (net.IP, uint16, error) {
+func (t *RegularOutTunnel) WaitForInit(ctx context.Context, events func(string)) (net.IP, uint16, error) {
 	var after time.Duration = 0
 	for {
 		select {
@@ -1141,6 +1141,10 @@ func (t *RegularOutTunnel) WaitForInit(ctx context.Context) (net.IP, uint16, err
 			return nil, 0, t.closerCtx.Err()
 		case <-t.initSignal:
 			if t.usePayments {
+				if events != nil {
+					events("Tunnel configured, waiting payments...")
+				}
+
 				t.requestPayment()
 				log.Info().Msg("adnl tunnel initialized, waiting payment confirmation...")
 
@@ -1150,8 +1154,14 @@ func (t *RegularOutTunnel) WaitForInit(ctx context.Context) (net.IP, uint16, err
 				case <-t.closerCtx.Done():
 					return nil, 0, t.closerCtx.Err()
 				case <-t.paidSignal:
-					// wait for payments to happen
+					if events != nil {
+						events("Tunnel payments received")
+					}
 				}
+			}
+
+			if events != nil {
+				events("Tunnel initialized")
 			}
 			return t.externalAddr, t.externalPort, nil
 		case <-time.After(after):
@@ -1236,7 +1246,7 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 			Seqno:         atomic.AddUint32(&t.seqnoForward, 1),
 			Payload:       payload,
 		}
-	} else {
+	} else if t.tunnelState > StateTypeConfiguring || p == nil {
 		msg, err = t.ReassembleInstructions(&EncryptedMessage{
 			SectionPubKey: t.chainTo[0].Keys.SectionPubKey,
 			Instructions:  t.currentSendInstructions,
@@ -1245,6 +1255,8 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		if err != nil {
 			return -1, fmt.Errorf("reassemble instructions error: %w", err)
 		}
+	} else {
+		return -1, fmt.Errorf("route is not yet configured")
 	}
 
 	if err = t.peer.SendCustomMessage(context.Background(), msg); err != nil {

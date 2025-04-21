@@ -27,6 +27,7 @@ import (
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/ton/wallet"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -48,20 +49,24 @@ var LogMaxSize = flag.Int("log-max-size", 1024, "maximum log file size in MB bef
 var LogMaxBackups = flag.Int("log-max-backups", 16, "maximum number of old log files to keep")
 var LogMaxAge = flag.Int("log-max-age", 180, "maximum number of days to retain old log files")
 var LogCompress = flag.Bool("log-compress", false, "whether to compress rotated log files")
+var LogDisableFile = flag.Bool("log-disable-file", false, "Disable logging to file")
 
 func main() {
 	flag.Parse()
 
 	// logs rotation
-	logWriter := &lumberjack.Logger{
-		Filename:   *LogFilename,
-		MaxSize:    *LogMaxSize, // mb
-		MaxBackups: *LogMaxBackups,
-		MaxAge:     *LogMaxAge, // days
-		Compress:   *LogCompress,
-	}
+	var logWriters = []io.Writer{zerolog.NewConsoleWriter()}
 
-	multi := zerolog.MultiLevelWriter(zerolog.NewConsoleWriter(), logWriter)
+	if !*LogDisableFile {
+		logWriters = append(logWriters, &lumberjack.Logger{
+			Filename:   *LogFilename,
+			MaxSize:    *LogMaxSize, // mb
+			MaxBackups: *LogMaxBackups,
+			MaxAge:     *LogMaxAge, // days
+			Compress:   *LogCompress,
+		})
+	}
+	multi := zerolog.MultiLevelWriter(logWriters...)
 
 	log.Logger = zerolog.New(multi).With().Timestamp().Logger().Level(zerolog.InfoLevel)
 	adnl.Logger = func(v ...any) {}
