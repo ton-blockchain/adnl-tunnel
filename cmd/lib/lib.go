@@ -116,7 +116,7 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 			w.Out = &LogWriter{
 				logger: logger,
 			}
-		})).With().Timestamp().Logger().Level(zerolog.InfoLevel)
+		})).With().Timestamp().Logger().Level(zerolog.DebugLevel)
 
 	log.Info().Str("path", path).Msg("using config")
 

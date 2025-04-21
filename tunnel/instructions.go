@@ -711,6 +711,18 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			Msg("out addr allocated")
 	} else {
 		s.out.mx.Lock()
+		changed := !bytes.Equal(s.out.InboundADNL, ins.InboundNodeADNL) ||
+			!bytes.Equal(s.out.PayloadCipherKey, sharedPayloadKey) ||
+			s.out.PayloadCipherKeyCRC != crc64.Checksum(sharedPayloadKey, crcTable) ||
+			!bytes.Equal(s.out.InboundSectionKey, ins.InboundSectionPubKey) ||
+			!bytes.Equal(s.out.Instructions, ins.InboundInstructions) ||
+			s.out.PricePerPacket.Cmp(new(big.Int).SetUint64(ins.PricePerPacket)) != 0
+
+		if !changed {
+			s.out.mx.Unlock()
+			return nil
+		}
+
 		s.out.InboundADNL = ins.InboundNodeADNL
 		s.out.PayloadCipherKey = sharedPayloadKey
 		s.out.PayloadCipherKeyCRC = crc64.Checksum(sharedPayloadKey, crcTable)
