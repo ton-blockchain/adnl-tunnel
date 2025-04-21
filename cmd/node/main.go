@@ -202,7 +202,7 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to prepare payment channels")
 		}
-		log.Info().Hex("payment-pub-key", chId).Msg("prioritized channel for payments is active")
+		log.Info().Str("payment-pub-key", base64.StdEncoding.EncodeToString(chId)).Msg("prioritized channel for payments is active")
 
 		pmt = tunnel.PaymentConfig{
 			Service:                pm,

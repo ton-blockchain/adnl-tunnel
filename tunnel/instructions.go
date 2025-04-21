@@ -273,14 +273,8 @@ func (ins BuildRouteInstruction) Execute(ctx context.Context, s *Section, msg *E
 		return fmt.Errorf("too low price per packet route: %d, min is %d", ins.PricePerPacket, s.gw.payments.MinPricePerPacketRoute)
 	}
 
-	// TODO: async?
-	peer, err := s.gw.discoverPeer(ctx, ins.TargetADNL)
-	if err != nil {
-		return fmt.Errorf("add peer for route failed: %w", err)
-	}
-
 	target := &RouteTarget{
-		Peer:           peer,
+		Peer:           s.gw.addPeer(ins.TargetADNL, nil),
 		ADNL:           ins.TargetADNL,
 		SectionKey:     ins.TargetSectionPubKey,
 		PricePerPacket: ins.PricePerPacket,
@@ -300,9 +294,12 @@ func (ins BuildRouteInstruction) Execute(ctx context.Context, s *Section, msg *E
 			PrepaidPackets: 0,
 			rate:           leakybucket.NewLeakyBucket(FreePacketsMaxPS, FreePacketsMaxPSBurst),
 		}
+		target.Peer.AddReference()
 		s.routes[ins.RouteID] = route
 	} else {
-		if existingTarget := (*RouteTarget)(atomic.LoadPointer(&route.Target)); existingTarget != nil &&
+		existingTarget := (*RouteTarget)(atomic.LoadPointer(&route.Target))
+		adnlChanged := !bytes.Equal(existingTarget.ADNL, target.ADNL)
+		if !adnlChanged &&
 			bytes.Equal(existingTarget.ADNL, target.ADNL) &&
 			bytes.Equal(existingTarget.SectionKey, target.SectionKey) &&
 			existingTarget.PricePerPacket == target.PricePerPacket {
@@ -310,12 +307,17 @@ func (ins BuildRouteInstruction) Execute(ctx context.Context, s *Section, msg *E
 			return nil
 		}
 
+		if adnlChanged {
+			existingTarget.Peer.Dereference()
+			target.Peer.AddReference()
+		}
+
 		atomic.StorePointer(&route.Target, unsafe.Pointer(target))
 	}
 
 	s.log.Info().
 		Uint32("id", ins.RouteID).
-		Str("target_addr", peer.peer.RemoteAddr()).
+		Str("target_addr", target.Peer.getAddr()).
 		Str("target_key", base64.StdEncoding.EncodeToString(ins.TargetSectionPubKey)).
 		Str("target_adnl", base64.StdEncoding.EncodeToString(ins.TargetADNL)).
 		Uint64("price_per_packet", ins.PricePerPacket).
@@ -326,6 +328,11 @@ func (ins BuildRouteInstruction) Execute(ctx context.Context, s *Section, msg *E
 
 type RouteCachedAction struct {
 	Route *Route
+}
+
+func (r *Route) dereferenceTarget() {
+	target := (*RouteTarget)(atomic.LoadPointer(&r.Target))
+	target.Peer.Dereference()
 }
 
 func (r *Route) Route(ctx context.Context, payload []byte, cached bool, instructions []byte, seqno uint32) error {
@@ -656,11 +663,6 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		return fmt.Errorf("no external addresses in gate")
 	}
 
-	peer, err := s.gw.discoverPeer(ctx, ins.InboundNodeADNL)
-	if err != nil {
-		return fmt.Errorf("add peer inbound route failed: %w", err)
-	}
-
 	sharedPayloadKey, err := adnl.SharedKey(s.gw.key, ins.ReceiverPubKey)
 	if err != nil {
 		return fmt.Errorf("calculate shared_payload key for out failed: %w", err)
@@ -685,7 +687,7 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 
 		closer, cancel := context.WithCancel(context.Background())
 		s.out = &Out{
-			inboundPeer:         peer,
+			inboundPeer:         s.gw.addPeer(ins.InboundNodeADNL, nil),
 			conn:                conn,
 			closer:              closer,
 			closerClose:         cancel,
@@ -700,18 +702,19 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			log:                 s.log.With().Str("component", "out").Logger(),
 		}
 
+		s.out.inboundPeer.AddReference()
 		go s.out.Listen(s.gw, 8)
-		atomic.AddUint64(&peer.references, 1)
 
 		port = uint16(s.out.conn.LocalAddr().(*net.UDPAddr).Port)
 		s.log.Info().
-			Str("from_addr", peer.peer.RemoteAddr()).
+			Str("back_addr", s.out.inboundPeer.getAddr()).
 			Uint16("alloc_port", port).
 			Str("back_route_adnl", base64.StdEncoding.EncodeToString(ins.InboundNodeADNL)).
 			Msg("out addr allocated")
 	} else {
 		s.out.mx.Lock()
-		changed := !bytes.Equal(s.out.InboundADNL, ins.InboundNodeADNL) ||
+		inADNLChanged := !bytes.Equal(s.out.InboundADNL, ins.InboundNodeADNL)
+		changed := inADNLChanged ||
 			!bytes.Equal(s.out.PayloadCipherKey, sharedPayloadKey) ||
 			s.out.PayloadCipherKeyCRC != crc64.Checksum(sharedPayloadKey, crcTable) ||
 			!bytes.Equal(s.out.InboundSectionKey, ins.InboundSectionPubKey) ||
@@ -719,6 +722,12 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			s.out.PricePerPacket.Cmp(new(big.Int).SetUint64(ins.PricePerPacket)) != 0
 
 		if changed {
+			if inADNLChanged {
+				s.out.inboundPeer.Dereference()
+				s.out.inboundPeer = s.gw.addPeer(ins.InboundNodeADNL, nil)
+				s.out.inboundPeer.AddReference()
+			}
+
 			s.out.InboundADNL = ins.InboundNodeADNL
 			s.out.PayloadCipherKey = sharedPayloadKey
 			s.out.PayloadCipherKeyCRC = crc64.Checksum(sharedPayloadKey, crcTable)
@@ -727,7 +736,7 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			s.out.PricePerPacket = new(big.Int).SetUint64(ins.PricePerPacket)
 
 			s.log.Info().
-				Str("peer", peer.peer.RemoteAddr()).
+				Str("back_addr", s.out.inboundPeer.getAddr()).
 				Uint16("port", port).
 				Str("back_route_adnl", base64.StdEncoding.EncodeToString(ins.InboundNodeADNL)).
 				Int("size", len(ins.InboundInstructions)).
@@ -864,6 +873,7 @@ type SendOutPayload struct {
 func (o *Out) Close() {
 	o.closerClose()
 	o.conn.Close()
+	o.inboundPeer.Dereference()
 
 	o.log.Debug().Msg("closing out")
 }
@@ -1034,9 +1044,4 @@ func (o *Out) sendBack(obj tl.Serializable, isPayload bool) error {
 		return fmt.Errorf("send message to inbound tunnel failed: %w", err)
 	}
 	return nil
-}
-
-func (p *Peer) SendCustomMessage(ctx context.Context, req tl.Serializable) error {
-	atomic.StoreInt64(&p.LastPacketToAt, time.Now().Unix())
-	return p.peer.SendCustomMessage(ctx, req)
 }

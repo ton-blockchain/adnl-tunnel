@@ -154,16 +154,11 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 		return nil, fmt.Errorf("calc receiver adnl id failed: %w", err)
 	}
 
-	peer, err := g.discoverPeer(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("register peer failed: %w", err)
-	}
-
 	closerCtx, closer := context.WithCancel(g.closerCtx)
 	rt := &RegularOutTunnel{
 		localID:         binary.LittleEndian.Uint32(pec.SectionPubKey), // first 4 bytes
 		gateway:         g,
-		peer:            peer,
+		peer:            g.addPeer(id, nil),
 		chainTo:         chainTo,
 		chainFrom:       chainFrom,
 		payloadKeys:     pec,
@@ -310,7 +305,6 @@ func (t *RegularOutTunnel) startSystemSender() {
 					continue
 				}
 
-				t.peer.peer.Reinit()
 				t.pingSeqnoReinitAt = t.pingSeqno
 
 				for {

@@ -55,6 +55,7 @@ type Route struct {
 	ID            uint32
 	Target        unsafe.Pointer // *RouteTarget
 	PacketsRouted uint64
+	Section       *Section
 
 	PaymentReceived bool
 	PrepaidPackets  int64
@@ -131,15 +132,6 @@ type Section struct {
 
 	log zerolog.Logger
 	mx  sync.RWMutex
-}
-
-type Peer struct {
-	peer       adnl.Peer
-	pingSeqno  uint64
-	references uint64
-
-	LastPacketFromAt int64
-	LastPacketToAt   int64
 }
 
 type Gateway struct {
@@ -267,26 +259,12 @@ func (g *Gateway) GetPacketsStats() map[string]*SectionStats {
 
 func (g *Gateway) Start() error {
 	connHandler := func(client adnl.Peer) error {
-		id := string(client.GetID())
+		p := g.addPeer(client.GetID(), client)
+
 		client.SetDisconnectHandler(func(addr string, key ed25519.PublicKey) {
-			g.mx.Lock()
-			delete(g.activePeers, id)
-			g.mx.Unlock()
+			p.closeConn(client)
 		})
 
-		p := &Peer{
-			peer:             client,
-			LastPacketFromAt: time.Now().Unix(),
-			LastPacketToAt:   0,
-		}
-
-		g.mx.Lock()
-		if pe := g.activePeers[id]; pe == nil || pe.peer != client {
-			g.activePeers[id] = p
-			log.Debug().Str("peer", base64.StdEncoding.EncodeToString([]byte(id))).Msg("new peer connected")
-			client.SetCustomMessageHandler(g.messageHandler(p))
-		}
-		g.mx.Unlock()
 		return nil
 	}
 
@@ -345,13 +323,34 @@ func (g *Gateway) keepAlivePeersAndSections() {
 			return
 		case <-ticker.C:
 			tm := time.Now().Unix()
+			var sectionsToClose []*Section
+			var paymentsToClose []*PaymentChannel
+
+			g.mx.RLock()
 			for _, peer := range g.activePeers {
 				if peer.LastPacketToAt > tm-5 {
 					continue
 				}
 
-				if peer.LastPacketFromAt < tm-PeerMaxInactiveSec {
-					// TODO: reconnect?
+				if atomic.LoadInt64(&peer.references) == 0 && tm-peer.CreatedAt > 10 {
+					peer.kill()
+					continue
+				}
+
+				if peer.LastPacketFromAt < tm-PeerMaxInactiveSec || atomic.LoadInt64(&peer.wantDiscoverAt) >= tm-3 {
+					if atomic.LoadInt32(&peer.discoverInProgress) == 0 && tm-atomic.LoadInt64(&peer.DiscoveredAt) > 15 {
+						peer.closeConn(nil)
+						go func(peer *Peer) {
+							g.log.Debug().Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("discovering peer")
+							ctx, cancel := context.WithTimeout(g.closerCtx, 60*time.Second)
+							err := peer.discover(ctx)
+							cancel()
+							if err != nil {
+								g.log.Debug().Err(err).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("peer discovery failed")
+							}
+						}(peer)
+					}
+					continue
 				}
 
 				err := peer.SendCustomMessage(context.Background(), Ping{
@@ -362,10 +361,6 @@ func (g *Gateway) keepAlivePeersAndSections() {
 				}
 			}
 
-			var sectionsToClose []*Section
-			var paymentsToClose []*PaymentChannel
-
-			g.mx.RLock()
 			for _, section := range g.inboundSections {
 				if !section.mx.TryLock() {
 					continue
@@ -461,8 +456,8 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 					payments:     map[string]*PaymentChannel{},
 					lastPacketAt: time.Now().Unix(),
 					log: g.log.With().
-						Str("from_addr", peer.peer.RemoteAddr()).
-						Str("from_adnl", base64.StdEncoding.EncodeToString(peer.peer.GetID())).
+						Str("from_addr", peer.getConn().RemoteAddr()).
+						Str("from_adnl", base64.StdEncoding.EncodeToString(peer.id)).
 						Str("tunnel", base64.StdEncoding.EncodeToString(m.SectionPubKey)).Logger(),
 				}
 				sec.log.Info().Msg("inbound section created")
@@ -501,50 +496,6 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 		atomic.StoreInt64(&peer.LastPacketFromAt, time.Now().Unix())
 		return nil
 	}
-}
-
-func (g *Gateway) discoverPeer(ctx context.Context, id []byte) (*Peer, error) {
-	g.mx.RLock()
-	peer := g.activePeers[string(id)]
-	g.mx.RUnlock()
-
-	if peer != nil {
-		return peer, nil
-	}
-
-	addresses, key, err := g.dht.FindAddresses(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("find peer addresses failed: %w", err)
-	}
-
-	if len(addresses.Addresses) == 0 {
-		return nil, fmt.Errorf("find peer addresses failed: empty address list")
-	}
-
-	addr := addresses.Addresses[0].IP.String() + ":" + fmt.Sprint(uint16(addresses.Addresses[0].Port))
-	p, err := g.gate.RegisterClient(addr, key)
-	if err != nil {
-		return nil, fmt.Errorf("register peer failed: %w", err)
-	}
-
-	peer = &Peer{
-		peer:             p,
-		LastPacketFromAt: time.Now().Unix(),
-		LastPacketToAt:   0,
-	}
-
-	g.mx.Lock()
-	if pCheck := g.activePeers[string(id)]; pCheck != nil {
-		// replace since it was registered in parallel already
-		peer = pCheck
-	} else {
-		// TODO: race?
-		p.SetCustomMessageHandler(g.messageHandler(peer))
-	}
-	g.activePeers[string(id)] = peer
-	g.mx.Unlock()
-
-	return peer, nil
 }
 
 func (s *Section) decryptMessage(m *EncryptedMessage) (*InstructionsContainer, []byte, error) {
@@ -647,9 +598,13 @@ func (s *Section) closeIfNotLocked() bool {
 		_ = s.gw.closePaymentChannel(ch)
 	}
 
+	for _, r := range s.routes {
+		r.dereferenceTarget()
+	}
+
 	if s.out != nil {
-		s.out.closerClose()
 		s.log.Debug().Msg("closing out port")
+		s.out.Close()
 	}
 	s.log.Debug().Msg("section closed")
 
