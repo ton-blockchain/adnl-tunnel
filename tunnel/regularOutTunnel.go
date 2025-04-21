@@ -173,6 +173,7 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 		close:           closer,
 		packetsToPrepay: ChannelPacketsToPrepay,
 	}
+	rt.peer.AddReference()
 
 	list := append([]*SectionInfo{}, chainTo...)
 	list = append(list, chainFrom...)

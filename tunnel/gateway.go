@@ -337,7 +337,7 @@ func (g *Gateway) keepAlivePeersAndSections() {
 					continue
 				}
 
-				if peer.LastPacketFromAt < tm-PeerMaxInactiveSec || atomic.LoadInt64(&peer.wantDiscoverAt) >= tm-3 {
+				if tm-peer.LastPacketFromAt > PeerMaxInactiveSec || atomic.LoadInt64(&peer.wantDiscoverAt) >= tm-3 {
 					if atomic.LoadInt32(&peer.discoverInProgress) == 0 && tm-atomic.LoadInt64(&peer.DiscoveredAt) > 15 {
 						peer.closeConn(nil)
 						go func(peer *Peer) {
