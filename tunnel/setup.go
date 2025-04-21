@@ -175,7 +175,7 @@ reinit:
 				return
 			case <-time.After(5 * time.Second):
 				now := time.Now().Unix()
-				if tun.lastFullyCheckedAt-now > 45 && now-lastAsk > 60 {
+				if now-tun.lastFullyCheckedAt > 45 && now-lastAsk > 60 {
 					tGate.log.Warn().Msg("tunnel is stalled for too long, asking about rerouting...")
 					if AskReroute() {
 						_ = tun.Close()
