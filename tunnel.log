@@ -1,9 +1,0 @@
-{"level":"info","time":"2025-04-21T12:15:45+06:00","message":"starting pprof server on :6065"}
-{"level":"info","time":"2025-04-21T12:15:45+06:00","message":"Initializing payment node "}
-{"level":"info","time":"2025-04-21T12:15:45+06:00","message":"initializing ton client with verified proof chain..."}
-{"level":"info","address":"EQChur4OiQFhv4vBB-QQK7J2CyVWKLh2SxynT3unj35iM-zQ","time":"2025-04-21T12:15:45+06:00","message":"start listening for channel events"}
-{"level":"info","addr":"UQC4-fnpzI6eedcLtNKsAK8PzL7r2cvqCK_4Z4RkApl6XtAF","time":"2025-04-21T12:15:45+06:00","message":"wallet initialized"}
-{"level":"info","pubkey":"ydu+Kp2KHrP7qoomOqcXBtIraDuhEgp8BM8RJHpqRnc=","time":"2025-04-21T12:15:45+06:00","message":"node initialized"}
-{"level":"info","payment-pub-key":"02d6c655f7181e615be7db28285edb056367107143c7a852b93f9fc2e42a1f95","time":"2025-04-21T12:15:45+06:00","message":"prioritized channel for payments is active"}
-{"level":"info","time":"2025-04-21T12:15:45+06:00","message":"Tunnel started, listening on 0.0.0.0:17330 ADNL id is: eh8a3p5eHpZX3evyijNuA8GNkw6VBjm6ODVIFSZ+ILk="}
-{"level":"info","time":"2025-04-21T12:15:45+06:00","message":"Input a command:"}
