@@ -56,6 +56,8 @@ type Payer struct {
 	CurrentChannel *VirtualPaymentChannel
 	PaidChannelFee *big.Int
 
+	LatestInstruction *PaymentInstruction
+
 	feeMx sync.RWMutex
 }
 
@@ -267,7 +269,7 @@ func (t *RegularOutTunnel) startSystemSender() {
 	case <-t.initSignal:
 	}
 
-	const CheckEvery = 2 * time.Second
+	const CheckEvery = 1 * time.Second
 
 	ticker := time.NewTicker(CheckEvery)
 
@@ -294,51 +296,50 @@ func (t *RegularOutTunnel) startSystemSender() {
 
 		var lastMsg *EncryptedMessage
 		var paymentDeadline time.Time
+		var forceResendPayments bool
 
 		lastMetaAt := atomic.LoadInt64(&t.lastFullyCheckedAt)
-		if lastMetaAt+int64((CheckEvery/time.Second)/2)*3 < time.Now().Unix() {
-			if t.pingSeqno-atomic.LoadUint64(&t.pingSeqnoReceived) > 3 && t.pingSeqno-t.pingSeqnoReinitAt > 3 {
-				if t.tunnelState != StateTypeConfiguring {
-					t.log.Info().Msg("tunnel looks disconnected, trying to reconfigure...")
+		if lastMetaAt+int64(CheckEvery/time.Second)*3 < time.Now().Unix() {
+			if t.pingSeqno-atomic.LoadUint64(&t.pingSeqnoReceived) > 3 && t.pingSeqno-t.pingSeqnoReinitAt > 3 &&
+				t.tunnelState != StateTypeConfiguring {
+				t.log.Info().Msg("tunnel looks disconnected, trying to reconfigure...")
 
-					// try to reconfigure tunnel in case server restart on one of the nodes on the way
-					if err = t.prepareInstructions(StateTypeConfiguring); err != nil {
-						t.log.Error().Err(err).Msg("prepare tunnel reconfigure instructions failed")
+				// try to reconfigure tunnel in case server restart on one of the nodes on the way
+				if err = t.prepareInstructions(StateTypeConfiguring); err != nil {
+					t.log.Error().Err(err).Msg("prepare tunnel reconfigure instructions failed")
+					continue
+				}
+
+				t.peer.peer.Reinit()
+				t.pingSeqnoReinitAt = t.pingSeqno
+
+				for {
+					t.log.Info().Msg("sending tunnel reinit")
+
+					if _, err := t.WriteTo(nil, initAddr); err != nil {
+						t.log.Error().Err(err).Msg("write to reconfigure tunnel failed")
 						continue
 					}
 
-					t.peer.peer.Reinit()
-					t.pingSeqnoReinitAt = t.pingSeqno
-
-					for {
-						t.log.Info().Msg("sending tunnel reinit")
-
-						if _, err := t.WriteTo(nil, initAddr); err != nil {
-							t.log.Error().Err(err).Msg("write to reconfigure tunnel failed")
-							continue
-						}
-
-						select {
-						case <-t.closerCtx.Done():
-							return
-						case <-ticker.C:
-						}
-
-						if t.tunnelState > StateTypeConfiguring {
-							// TODO: remove after payments recovery logic, this is temp
-							t.seqnoRecv = 0
-							t.seqnoSend = 0
-							if t.paymentSeqno > 0 {
-								// to resend last payment msg
-								t.paymentSeqnoReceived = t.paymentSeqno - 1
-							}
-
-							t.log.Info().Msg("tunnel reinitialized successfully")
-							break
-						}
+					select {
+					case <-t.closerCtx.Done():
+						return
+					case <-ticker.C:
 					}
-					continue
+
+					if t.tunnelState > StateTypeConfiguring {
+						// TODO: remove after payments recovery logic, this is temp
+						t.seqnoRecv = 0
+						t.seqnoSend = 0
+						if t.usePayments {
+							forceResendPayments = true
+						}
+
+						t.log.Info().Msg("tunnel reinitialized successfully")
+						break
+					}
 				}
+				continue
 			}
 
 			lastMsg, err = t.prepareTunnelPings()
@@ -352,7 +353,7 @@ func (t *RegularOutTunnel) startSystemSender() {
 			received := atomic.LoadUint64(&t.packetsRecv)
 			paidUsed := atomic.LoadUint64(&t.packetsRecvPaidConsumed)
 
-			if t.paymentSeqnoReceived >= t.paymentSeqno || paymentDeadline.Before(time.Now()) {
+			if t.paymentSeqnoReceived >= t.paymentSeqno || paymentDeadline.Before(time.Now()) || forceResendPayments {
 				// we're paying for seqno, because packets arrive asynchronously, and we cannot know what is lost on the way
 				// so we trust seqno here, but validating it against received packets num, we agree for up to 33% loss
 				// if loss is higher we cannot trust this tunnel and will notify user and stop payments until normalization
@@ -363,12 +364,13 @@ func (t *RegularOutTunnel) startSystemSender() {
 					continue
 				}
 
-				lastMsg, paymentDeadline, err = t.prepareTunnelPayments()
+				lastMsg, paymentDeadline, err = t.prepareTunnelPayments(forceResendPayments)
 				if err != nil {
 					t.log.Error().Err(err).Msg("prepare tunnel payments failed")
 					continue
 				}
 				lastPaymentMsg = lastMsg
+				forceResendPayments = false
 			} else if lastPaymentMsg != nil {
 				msg, err := t.ReassembleInstructions(lastPaymentMsg)
 				if err != nil {
@@ -728,7 +730,7 @@ func (t *RegularOutTunnel) reassembleInstructions(msg *EncryptedMessage) (*Encry
 	return newMsg, nil
 }
 
-func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, time.Time, error) {
+func (t *RegularOutTunnel) prepareTunnelPayments(forceLatest bool) (*EncryptedMessage, time.Time, error) {
 	t.mx.Lock()
 	defer t.mx.Unlock()
 
@@ -845,7 +847,10 @@ func (t *RegularOutTunnel) prepareTunnelPayments() (*EncryptedMessage, time.Time
 					} else {
 						p.CurrentChannel.LastAmount.Set(stateAmount)
 					}
+					p.LatestInstruction = &pi
 				})
+			} else if forceLatest && p.LatestInstruction != nil {
+				instructions = append(instructions, *p.LatestInstruction)
 			}
 		}
 
