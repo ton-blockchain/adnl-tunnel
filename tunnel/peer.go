@@ -101,6 +101,8 @@ func (p *Peer) discover(ctx context.Context) error {
 	atomic.StoreInt64(&p.DiscoveredAt, time.Now().Unix())
 	// TODO: ping?
 
+	log.Info().Str("id", base64.StdEncoding.EncodeToString(p.id)).Str("addr", conn.RemoteAddr()).Msg("peer discovered")
+
 	return nil
 }
 

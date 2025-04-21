@@ -328,14 +328,12 @@ func (g *Gateway) keepAlivePeersAndSections() {
 
 			g.mx.RLock()
 			for _, peer := range g.activePeers {
-				if peer.LastPacketToAt > tm-5 {
-					continue
-				}
-
 				if atomic.LoadInt64(&peer.references) == 0 && tm-peer.CreatedAt > 10 {
 					peer.kill()
 					continue
 				}
+
+				g.log.Debug().Int64("refs", atomic.LoadInt64(&peer.references)).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Int64("inactive", tm-peer.LastPacketFromAt).Int64("want_discover", peer.wantDiscoverAt).Msg("checking peer")
 
 				if tm-peer.LastPacketFromAt > PeerMaxInactiveSec || atomic.LoadInt64(&peer.wantDiscoverAt) >= tm-3 {
 					if atomic.LoadInt32(&peer.discoverInProgress) == 0 && tm-atomic.LoadInt64(&peer.DiscoveredAt) > 15 {
