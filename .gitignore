@@ -3,3 +3,4 @@ payments-db
 adnl-tu*
 *.json
 tunnel-node
+*.log

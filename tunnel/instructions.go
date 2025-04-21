@@ -718,27 +718,24 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			!bytes.Equal(s.out.Instructions, ins.InboundInstructions) ||
 			s.out.PricePerPacket.Cmp(new(big.Int).SetUint64(ins.PricePerPacket)) != 0
 
-		if !changed {
-			s.out.mx.Unlock()
-			return nil
-		}
+		if changed {
+			s.out.InboundADNL = ins.InboundNodeADNL
+			s.out.PayloadCipherKey = sharedPayloadKey
+			s.out.PayloadCipherKeyCRC = crc64.Checksum(sharedPayloadKey, crcTable)
+			s.out.InboundSectionKey = ins.InboundSectionPubKey
+			s.out.Instructions = ins.InboundInstructions
+			s.out.PricePerPacket = new(big.Int).SetUint64(ins.PricePerPacket)
 
-		s.out.InboundADNL = ins.InboundNodeADNL
-		s.out.PayloadCipherKey = sharedPayloadKey
-		s.out.PayloadCipherKeyCRC = crc64.Checksum(sharedPayloadKey, crcTable)
-		s.out.InboundSectionKey = ins.InboundSectionPubKey
-		s.out.Instructions = ins.InboundInstructions
-		s.out.PricePerPacket = new(big.Int).SetUint64(ins.PricePerPacket)
+			s.log.Info().
+				Str("peer", peer.peer.RemoteAddr()).
+				Uint16("port", port).
+				Str("back_route_adnl", base64.StdEncoding.EncodeToString(ins.InboundNodeADNL)).
+				Int("size", len(ins.InboundInstructions)).
+				Msg("out addr reconfigured")
+		}
 		s.out.mx.Unlock()
 
 		port = uint16(s.out.conn.LocalAddr().(*net.UDPAddr).Port)
-
-		s.log.Info().
-			Str("peer", peer.peer.RemoteAddr()).
-			Uint16("port", port).
-			Str("back_route_adnl", base64.StdEncoding.EncodeToString(ins.InboundNodeADNL)).
-			Int("size", len(ins.InboundInstructions)).
-			Msg("out addr reconfigured")
 	}
 
 	if err = s.out.sendBack(OutBindDonePayload{

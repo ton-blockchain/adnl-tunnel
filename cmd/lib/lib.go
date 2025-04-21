@@ -208,7 +208,7 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 			n, addr, err := tun.ReadFromWithTimeout(ctx, buf[off+18:])
 			if err != nil {
 				if !errors.Is(err, context.DeadlineExceeded) {
-					log.Debug().Err(err).Msg("failed to read from tunnel")
+					log.Trace().Err(err).Msg("failed to read from tunnel")
 					time.Sleep(10 * time.Millisecond)
 					continue
 				}
@@ -218,7 +218,7 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 			}
 
 			if n > adnl.MaxMTU {
-				log.Debug().Msg("skip message bigger than max mtu")
+				log.Trace().Msg("skip message bigger than max mtu")
 				continue
 			}
 
@@ -265,7 +265,7 @@ func WriteTunnel(tunIdx C.size_t, data *C.uint8_t, num C.size_t) C.int {
 	for i := 0; i < int(num); i++ {
 		addr, err := parseSockAddr(buf[off:])
 		if err != nil {
-			log.Error().Err(err).Msg("invalid sock addr when trying to send")
+			log.Trace().Err(err).Msg("invalid sock addr when trying to send")
 
 			return 0
 		}
@@ -273,7 +273,7 @@ func WriteTunnel(tunIdx C.size_t, data *C.uint8_t, num C.size_t) C.int {
 		sz := int(buf[off+16])<<8 + int(buf[off+17])
 
 		if _, err = tun.WriteTo(buf[off+18:off+18+sz], addr); err != nil {
-			log.Debug().Err(err).Msg("failed to write to tunnel")
+			log.Trace().Err(err).Msg("failed to write to tunnel")
 			return -1
 		}
 
