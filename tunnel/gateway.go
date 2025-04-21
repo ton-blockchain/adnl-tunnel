@@ -375,9 +375,11 @@ func (g *Gateway) keepAlivePeersAndSections() {
 					sectionsToClose = append(sectionsToClose, section)
 				} else {
 					for k, channel := range section.payments {
-						if channel.Active && channel.Deadline < tm {
-							paymentsToClose = append(paymentsToClose, channel)
-						} else if !channel.Active {
+						if channel.Deadline < tm {
+							if channel.Active {
+								paymentsToClose = append(paymentsToClose, channel)
+								continue
+							}
 							delete(section.payments, k)
 						}
 					}

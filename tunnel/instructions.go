@@ -440,6 +440,7 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 	v := s.payments[string(ins.Key)]
 	s.mx.RUnlock()
 
+	justLoadedAndCountable := false
 	if v == nil {
 		vc, err := s.gw.payments.Service.GetVirtualChannelMeta(ctx, ins.Key)
 		if err != nil {
@@ -474,9 +475,11 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			return fmt.Errorf("incorrect capacity: %w", err)
 		}
 
+		justLoadedAndCountable = time.Until(vc.Incoming.SafeDeadline) >= MinChannelTimeoutSec*time.Second
+
 		v = &PaymentChannel{
 			Key:         ins.Key,
-			Active:      vc.Status == db.VirtualChannelStateActive && time.Until(vc.Incoming.SafeDeadline) >= MinChannelTimeoutSec*time.Second,
+			Active:      vc.Status == db.VirtualChannelStateActive && justLoadedAndCountable,
 			Deadline:    vc.Incoming.SafeDeadline.Unix(),
 			Capacity:    capacity.Nano(),
 			Purpose:     ins.Purpose,
@@ -501,7 +504,7 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 	}
 
 	var lastAmt *big.Int
-	if v.LatestState != nil {
+	if v.LatestState != nil && !justLoadedAndCountable { // we count first after restart even if it was paid before
 		lastAmt = v.LatestState.Amount.Nano()
 	} else {
 		lastAmt = big.NewInt(0)
@@ -513,7 +516,8 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		return nil
 	}
 
-	if !v.Active {
+	// even if channel is closed, we accept payment, because we may restart before
+	if !v.Active && !justLoadedAndCountable {
 		return fmt.Errorf("payment channel is inactive")
 	}
 

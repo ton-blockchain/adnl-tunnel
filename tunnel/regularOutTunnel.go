@@ -1007,8 +1007,6 @@ func (t *RegularOutTunnel) prepareInstructions(state uint32) error {
 }
 
 func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
-	atomic.StoreInt64(&t.lastFullyCheckedAt, time.Now().Unix())
-
 	switch m := meta.(type) {
 	case StateMeta:
 		data, err := t.payloadKeys.decryptRecvPayload(payload)
@@ -1109,6 +1107,7 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 		}
 	case PingMeta:
 		if m.Seqno > atomic.LoadUint64(&t.pingSeqnoReceived) {
+			atomic.StoreInt64(&t.lastFullyCheckedAt, time.Now().Unix())
 			atomic.StoreUint64(&t.pingSeqnoReceived, m.Seqno)
 		}
 		return nil
@@ -1118,6 +1117,7 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 				if !atomic.CompareAndSwapUint64(&t.paymentSeqnoReceived, sq, m.Seqno) {
 					continue
 				}
+				atomic.StoreInt64(&t.lastFullyCheckedAt, time.Now().Unix())
 				t.log.Debug().Uint64("seqno", t.paymentSeqnoReceived).Msg("payment confirmed for every node in tunnel")
 			}
 			break
