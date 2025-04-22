@@ -60,6 +60,7 @@ func (g *Gateway) addPeer(id []byte, conn adnl.Peer) *Peer {
 	if conn != nil {
 		conn.SetCustomMessageHandler(g.messageHandler(peer))
 		atomic.StorePointer(&peer.conn, unsafe.Pointer(&connAtomic{conn: conn, addr: conn.RemoteAddr()}))
+		atomic.StoreInt64(&peer.DiscoveredAt, time.Now().Unix())
 	}
 	peer.mx.Unlock()
 

@@ -130,8 +130,9 @@ type Section struct {
 	seqno       SeqnoWindow
 	seqnoCached SeqnoWindow
 
-	log zerolog.Logger
-	mx  sync.RWMutex
+	lastOnceLogAt int64
+	log           zerolog.Logger
+	mx            sync.RWMutex
 }
 
 type Gateway struct {
@@ -340,16 +341,18 @@ func (g *Gateway) keepAlivePeersAndSections() {
 					peer.closeConn(nil)
 				}
 
-				if peer.getConn() == nil && atomic.LoadInt32(&peer.discoverInProgress) == 0 {
-					go func(peer *Peer) {
-						g.log.Debug().Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("discovering peer")
-						ctx, cancel := context.WithTimeout(g.closerCtx, 60*time.Second)
-						err := peer.discover(ctx)
-						cancel()
-						if err != nil {
-							g.log.Debug().Err(err).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("peer discovery failed")
-						}
-					}(peer)
+				if conn := peer.getConn(); conn == nil {
+					if atomic.LoadInt32(&peer.discoverInProgress) == 0 {
+						go func(peer *Peer) {
+							g.log.Debug().Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("discovering peer")
+							ctx, cancel := context.WithTimeout(g.closerCtx, 60*time.Second)
+							err := peer.discover(ctx)
+							cancel()
+							if err != nil {
+								g.log.Debug().Err(err).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("peer discovery failed")
+							}
+						}(peer)
+					}
 					continue
 				}
 
@@ -422,7 +425,7 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 			}
 
 			if !sec.checkSeqno(m.Seqno, true) {
-				sec.log.Debug().Uint32("seqno", m.Seqno).Uint32("last_seqno", sec.seqnoCached.latest).Msg("repeating cached packet")
+				sec.logOnce().Uint32("seqno", m.Seqno).Uint32("last_seqno", sec.seqnoCached.latest).Msg("repeating cached packet")
 				return fmt.Errorf("repeating cached packet")
 			}
 
@@ -433,7 +436,7 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 			atomic.StoreInt64(&sec.lastPacketAt, time.Now().Unix())
 			for i, inst := range sec.cachedActions {
 				if err := inst.Execute(g.closerCtx, sec, &m); err != nil {
-					sec.log.Debug().Type("instruction", inst).Err(err).Msg("execute cached instruction failed")
+					sec.logOnce().Type("instruction", inst).Err(err).Msg("execute cached instruction failed")
 					return fmt.Errorf("execute cached action %d error: %w", i, err)
 				}
 			}
@@ -475,7 +478,7 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 			}
 
 			if !sec.checkSeqno(container.Seqno, false) {
-				sec.log.Debug().Uint32("seqno", container.Seqno).Uint32("last_seqno", sec.seqno.latest).Msg("repeating instructions packet")
+				sec.logOnce().Uint32("seqno", container.Seqno).Uint32("last_seqno", sec.seqno.latest).Msg("repeating instructions packet")
 
 				return fmt.Errorf("repeating instructions packet")
 			}
@@ -487,7 +490,7 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 			atomic.StoreInt64(&sec.lastPacketAt, time.Now().Unix())
 			for i, inst := range container.List {
 				if err = inst.(Instruction).Execute(g.closerCtx, sec, &m, restInstructions); err != nil {
-					sec.log.Debug().Int("index", i).Type("instruction", inst).Err(err).Msg("execute instruction failed")
+					sec.logOnce().Int("index", i).Type("instruction", inst).Err(err).Msg("execute instruction failed")
 					return fmt.Errorf("execute instruction %d (%T) error: %w", i, inst, err)
 				}
 			}
@@ -499,6 +502,17 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 
 		return nil
 	}
+}
+
+func (s *Section) logOnce() *zerolog.Event {
+	e := s.log.Trace()
+	now := time.Now().UnixMilli()
+	if v := atomic.LoadInt64(&s.lastOnceLogAt); v < time.Now().UnixMilli()-500 {
+		if atomic.CompareAndSwapInt64(&s.lastOnceLogAt, v, now) {
+			e = s.log.Debug()
+		}
+	}
+	return e
 }
 
 func (s *Section) decryptMessage(m *EncryptedMessage) (*InstructionsContainer, []byte, error) {

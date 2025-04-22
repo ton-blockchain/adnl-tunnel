@@ -56,7 +56,10 @@ type Payer struct {
 	CurrentChannel *VirtualPaymentChannel
 	PaidChannelFee *big.Int
 
-	LatestInstruction *PaymentInstruction
+	LatestChannelDeadline time.Time
+	LatestPaidOnSeqno     uint64
+	LatestInstruction     *PaymentInstruction
+	LatestPacketsPaid     int64
 
 	feeMx sync.RWMutex
 }
@@ -67,16 +70,15 @@ type SectionInfo struct {
 }
 
 type RegularOutTunnel struct {
-	localID     uint32
-	gateway     *Gateway
-	peer        *Peer
-	usePayments bool
+	localID           uint32
+	gateway           *Gateway
+	peer              *Peer
+	usePayments       bool
+	paymentsConfirmed int32
 
 	tunnelState       uint32
 	tunnelInitialized bool
-	markPaidOnce      sync.Once
 	initSignal        chan struct{}
-	paidSignal        chan struct{}
 	paySignal         chan struct{}
 	externalAddr      net.IP
 	externalPort      uint16
@@ -97,11 +99,10 @@ type RegularOutTunnel struct {
 	packetsDropped          uint64
 	packetsSent             uint64
 
-	paymentSeqno         uint64
-	paymentSeqnoReceived uint64
-	pingSeqno            uint64
-	pingSeqnoReceived    uint64
-	pingSeqnoReinitAt    uint64
+	controlSeqno             uint64
+	controlSeqnoReceived     uint64
+	controlPaidSeqnoReceived uint64
+	controlSeqnoReinitAt     uint64
 
 	packetsToPrepay int64
 
@@ -156,22 +157,22 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 
 	closerCtx, closer := context.WithCancel(g.closerCtx)
 	rt := &RegularOutTunnel{
-		localID:         binary.LittleEndian.Uint32(pec.SectionPubKey), // first 4 bytes
-		gateway:         g,
-		peer:            g.addPeer(id, nil),
-		chainTo:         chainTo,
-		chainFrom:       chainFrom,
-		payloadKeys:     pec,
-		initSignal:      make(chan struct{}, 1),
-		paidSignal:      make(chan struct{}, 1),
-		paySignal:       make(chan struct{}, 1),
-		read:            make(chan DeliverUDPPayload, 512*1024),
-		localAddr:       net.UDPAddrFromAddrPort(ap),
-		tunnelState:     StateTypeConfiguring,
-		log:             log,
-		closerCtx:       closerCtx,
-		close:           closer,
-		packetsToPrepay: ChannelPacketsToPrepay,
+		localID:            binary.LittleEndian.Uint32(pec.SectionPubKey), // first 4 bytes
+		gateway:            g,
+		peer:               g.addPeer(id, nil),
+		chainTo:            chainTo,
+		chainFrom:          chainFrom,
+		payloadKeys:        pec,
+		initSignal:         make(chan struct{}, 1),
+		paySignal:          make(chan struct{}, 1),
+		read:               make(chan DeliverUDPPayload, 512*1024),
+		localAddr:          net.UDPAddrFromAddrPort(ap),
+		tunnelState:        StateTypeConfiguring,
+		log:                log,
+		closerCtx:          closerCtx,
+		close:              closer,
+		packetsToPrepay:    ChannelPacketsToPrepay,
+		lastFullyCheckedAt: time.Now().Unix(),
 	}
 	rt.peer.AddReference()
 
@@ -188,7 +189,7 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 		}
 	}
 
-	go rt.startSystemSender()
+	go rt.startControlSender()
 
 	if err = rt.prepareInstructions(StateTypeConfiguring); err != nil {
 		return nil, fmt.Errorf("prepare initial instructions failed: %w", err)
@@ -258,7 +259,7 @@ func (t *RegularOutTunnel) SetOutAddressChangedHandler(f func(addr *net.UDPAddr)
 	t.onOutAddressChanged = f
 }
 
-func (t *RegularOutTunnel) startSystemSender() {
+func (t *RegularOutTunnel) startControlSender() {
 	select {
 	case <-t.closerCtx.Done():
 		return
@@ -271,9 +272,6 @@ func (t *RegularOutTunnel) startSystemSender() {
 
 	lastTry := time.Time{}
 
-	var forceResendPayments bool
-	var lastPaymentMsg *EncryptedMessage
-	var err error
 	for {
 		ticker.Reset(CheckEvery)
 
@@ -282,7 +280,6 @@ func (t *RegularOutTunnel) startSystemSender() {
 			return
 		case <-t.paySignal:
 		case <-ticker.C:
-
 		}
 
 		if since := time.Since(lastTry); since < 200*time.Millisecond {
@@ -291,105 +288,71 @@ func (t *RegularOutTunnel) startSystemSender() {
 		}
 		lastTry = time.Now()
 
-		var lastMsg *EncryptedMessage
-		var paymentDeadline time.Time
-
-		lastMetaAt := atomic.LoadInt64(&t.lastFullyCheckedAt)
-		if lastMetaAt+int64(CheckEvery/time.Second)*10 < time.Now().Unix() {
-			if t.pingSeqno-atomic.LoadUint64(&t.pingSeqnoReceived) > 3 && t.pingSeqno-t.pingSeqnoReinitAt > 3 &&
-				t.tunnelState != StateTypeConfiguring {
-				t.log.Info().Msg("tunnel looks disconnected, trying to reconfigure...")
-
-				// try to reconfigure tunnel in case server restart on one of the nodes on the way
-				if err = t.prepareInstructions(StateTypeConfiguring); err != nil {
-					t.log.Error().Err(err).Msg("prepare tunnel reconfigure instructions failed")
-					continue
-				}
-
-				t.pingSeqnoReinitAt = t.pingSeqno
-
-				for {
-					t.log.Info().Msg("sending tunnel reinit")
-
-					if _, err := t.WriteTo(nil, initAddr); err != nil {
-						t.log.Error().Err(err).Msg("write to reconfigure tunnel failed")
-						continue
-					}
-
-					select {
-					case <-t.closerCtx.Done():
-						return
-					case <-ticker.C:
-					}
-
-					if t.tunnelState > StateTypeConfiguring {
-						// TODO: remove after payments recovery logic, this is temp
-						t.seqnoRecv = 0
-						t.seqnoSend = 0
-						if t.usePayments {
-							forceResendPayments = true
-						}
-
-						t.log.Info().Msg("tunnel reinitialized successfully")
-						break
-					}
-				}
-				continue
-			}
-
-			lastMsg, err = t.prepareTunnelPings()
-			if err != nil {
-				t.log.Error().Err(err).Msg("prepare tunnel pings failed")
-				continue
-			}
-		}
-
-		if t.usePayments && lastMsg == nil {
+		var paidRecvLoss float64
+		var attachPayments = false
+		if t.usePayments {
 			received := atomic.LoadUint64(&t.packetsRecv)
 			paidUsed := atomic.LoadUint64(&t.packetsRecvPaidConsumed)
 
-			if t.paymentSeqnoReceived >= t.paymentSeqno || paymentDeadline.Before(time.Now()) || forceResendPayments {
-				// we're paying for seqno, because packets arrive asynchronously, and we cannot know what is lost on the way
-				// so we trust seqno here, but validating it against received packets num, we agree for up to 33% loss
-				// if loss is higher we cannot trust this tunnel and will notify user and stop payments until normalization
+			// attaching payments only after checking that tunnel works
+			attachPayments = t.controlSeqno > 0 && t.controlSeqno == t.controlSeqnoReceived
+			if attachPayments {
 				const LossNumAcceptable = 5000 // + 33%
 				if paidUsed > received+received/3+LossNumAcceptable {
+					attachPayments = false
 					// TODO: reinit something instead, with a new tunnel
 					t.log.Warn().Uint64("seqno", atomic.LoadUint64(&t.seqnoRecv)).Uint64("received", received).Msg("more than 33% incoming packets lost according to seqno, very unstable network or tunnel seems trying to cheat to get more payments")
-					continue
 				}
-
-				lastMsg, paymentDeadline, err = t.prepareTunnelPayments(forceResendPayments)
-				if err != nil {
-					t.log.Error().Err(err).Msg("prepare tunnel payments failed")
-					continue
-				}
-				lastPaymentMsg = lastMsg
-				forceResendPayments = false
-			} else if lastPaymentMsg != nil {
-				msg, err := t.ReassembleInstructions(lastPaymentMsg)
-				if err != nil {
-					t.log.Error().Err(err).Msg("reassemble instructions failed")
-					continue
-				}
-				lastMsg = msg
 			}
 
-			if lastMsg != nil {
-				t.log.Debug().Uint64("seqno", t.paymentSeqno).Msg("sending payment")
-			}
-
-			loss := float64(paidUsed-received) / float64(paidUsed)
-			t.log.Debug().Float64("loss", loss).
-				Uint64("payments_seqno_diff", t.paymentSeqno-t.paymentSeqnoReceived).
-				Int64("consumed_out", atomic.LoadInt64(&t.packetsConsumedOut)).
-				Int64("consumed_in", atomic.LoadInt64(&t.packetsConsumedIn)).
-				Msg("tunnel stats")
+			paidRecvLoss = float64(paidUsed-received) / float64(paidUsed)
 		}
 
-		if lastMsg == nil {
+		lastMsg, _, err := t.prepareTunnelControlMessage(attachPayments, atomic.LoadInt32(&t.paymentsConfirmed) == 0)
+		if err != nil {
+			t.log.Error().Err(err).Msg("prepare tunnel pings failed")
 			continue
 		}
+
+		if time.Now().Unix()-atomic.LoadInt64(&t.lastFullyCheckedAt) > 15 {
+			t.log.Info().Msg("tunnel looks disconnected, trying to reconfigure...")
+
+			// try to reconfigure tunnel in case server restart on one of the nodes on the way
+			if err = t.prepareInstructions(StateTypeConfiguring); err != nil {
+				t.log.Error().Err(err).Msg("prepare tunnel reconfigure instructions failed")
+				continue
+			}
+
+			t.controlSeqnoReinitAt = t.controlSeqno
+			atomic.StoreInt32(&t.paymentsConfirmed, 0)
+
+			for {
+				t.log.Info().Msg("sending tunnel reinit")
+
+				if _, err := t.WriteTo(nil, initAddr); err != nil {
+					t.log.Error().Err(err).Msg("write to reconfigure tunnel failed")
+					continue
+				}
+
+				select {
+				case <-t.closerCtx.Done():
+					return
+				case <-ticker.C:
+				}
+
+				if t.tunnelState > StateTypeConfiguring {
+					t.log.Info().Msg("tunnel reinitialized successfully")
+					break
+				}
+			}
+			continue
+		}
+
+		t.log.Debug().Float64("paid_recv_loss", paidRecvLoss).
+			Uint64("seqno_diff", t.controlSeqno-t.controlSeqnoReceived).
+			Int64("out_left", atomic.LoadInt64(&t.packetsMinPaidOut)-atomic.LoadInt64(&t.packetsConsumedOut)).
+			Int64("in_left", atomic.LoadInt64(&t.packetsMinPaidIn)-atomic.LoadInt64(&t.packetsConsumedIn)).
+			Msg("sending control message")
 
 		if err = t.peer.SendCustomMessage(context.Background(), lastMsg); err != nil {
 			t.log.Error().Err(err).Msg("send tunnel payments failed, retrying")
@@ -569,47 +532,6 @@ func (t *RegularOutTunnel) openVirtualChannel(p *Payer, capacity *big.Int) (*Vir
 	}, nil
 }
 
-func (t *RegularOutTunnel) prepareTunnelPings() (*EncryptedMessage, error) {
-	t.mx.Lock()
-	defer t.mx.Unlock()
-
-	msg := &EncryptedMessage{}
-
-	nodes := append([]*SectionInfo{}, t.chainTo...)
-	nodes = append(nodes, t.chainFrom...)
-
-	for i := len(nodes) - 1; i >= 0; i-- {
-		if i == len(nodes)-1 {
-			// we don't need to pay ourselves, just deliver meta about payments received
-			if err := nodes[i].Keys.EncryptInstructionsMessage(msg, DeliverInitiatorInstruction{
-				From: t.localID,
-				Metadata: PingMeta{
-					Seqno: t.pingSeqno + 1,
-				},
-			}); err != nil {
-				return nil, fmt.Errorf("encrypt failed: %w", err)
-			}
-			continue
-		}
-
-		var instructions []tl.Serializable
-
-		routeId := binary.LittleEndian.Uint32(nodes[i+1].Keys.SectionPubKey)
-		instructions = append(instructions, RouteInstruction{
-			RouteID: ^routeId, // through system tunnel
-		})
-
-		if err := nodes[i].Keys.EncryptInstructionsMessage(msg, instructions...); err != nil {
-			return nil, fmt.Errorf("encrypt failed: %w", err)
-		}
-	}
-
-	t.pingSeqno++
-
-	t.log.Debug().Int("size", len(t.currentSendInstructions)).Msg("ping instructions prepared")
-	return msg, nil
-}
-
 func (t *RegularOutTunnel) resolveSection(key ed25519.PublicKey) (*SectionInfo, *SectionInfo) {
 	var next *SectionInfo
 
@@ -725,7 +647,7 @@ func (t *RegularOutTunnel) reassembleInstructions(msg *EncryptedMessage) (*Encry
 	return newMsg, nil
 }
 
-func (t *RegularOutTunnel) prepareTunnelPayments(forceLatest bool) (*EncryptedMessage, time.Time, error) {
+func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePayments bool) (*EncryptedMessage, time.Time, error) {
 	t.mx.Lock()
 	defer t.mx.Unlock()
 
@@ -747,11 +669,12 @@ func (t *RegularOutTunnel) prepareTunnelPayments(forceLatest bool) (*EncryptedMe
 
 	for i := len(nodes) - 1; i >= 0; i-- {
 		if i == len(nodes)-1 {
-			// we don't need to pay ourselves, just deliver meta about payments received
+			// deliver meta to ourself
 			if err := nodes[i].Keys.EncryptInstructionsMessage(msg, DeliverInitiatorInstruction{
 				From: t.localID,
-				Metadata: PaymentMeta{
-					Seqno: t.paymentSeqno + 1,
+				Metadata: PingMeta{
+					Seqno:        t.controlSeqno + 1,
+					WithPayments: withPayments,
 				},
 			}); err != nil {
 				return nil, time.Time{}, fmt.Errorf("encrypt failed: %w", err)
@@ -763,89 +686,112 @@ func (t *RegularOutTunnel) prepareTunnelPayments(forceLatest bool) (*EncryptedMe
 
 		routeId := binary.LittleEndian.Uint32(nodes[i+1].Keys.SectionPubKey)
 		// check if we need to pay
-		if p := nodes[i].PaymentInfo; p != nil && p.PricePerPacket > 0 {
-			prepay := consumedOut
-			if i >= len(t.chainTo) {
-				prepay = consumedIn
-			} else if i == len(t.chainTo)-1 {
-				// out gate
-				prepay = consumedMax
-			}
-			prepay -= p.PaidPackets
-			prepay += t.packetsToPrepay
+		if p := nodes[i].PaymentInfo; withPayments && p != nil && p.PricePerPacket > 0 {
+			skipNewPayment := false
+			if p.LatestInstruction != nil &&
+				p.LatestPaidOnSeqno > atomic.LoadUint64(&t.controlPaidSeqnoReceived) {
+				// not yet processed payment, will not send a new one, attach old
 
-			if prepay > t.packetsToPrepay/2 {
-				price := new(big.Int).SetUint64(p.PricePerPacket)
-				if p.CurrentChannel == nil || p.CurrentChannel.SafeDeadline.Before(time.Now()) {
-					regularAmount := new(big.Int).Mul(big.NewInt(t.packetsToPrepay), price)
-					// make capacity enough for ChannelCapacityForNumPayments payments,
-					// but in fact it can be less if intermediate nodes not allow this amount
-					wantCap := new(big.Int).Mul(regularAmount, big.NewInt(ChannelCapacityForNumPayments))
-
-					var err error
-					if p.CurrentChannel, err = t.openVirtualChannel(p, wantCap); err != nil {
-						return nil, time.Time{}, fmt.Errorf("open virtual channel failed: %w", err)
-					}
-				}
-
-				left := new(big.Int).Sub(p.CurrentChannel.Capacity, p.CurrentChannel.LastAmount)
-
-				isFinal := true
-				payFor := new(big.Int).Div(left, price).Int64()
-				if payFor > prepay {
-					isFinal = false
-					payFor = prepay
-				}
-
-				if debt := prepay - payFor; debt > 0 {
-					// we cannot pay for this in single payment channel, amount is too big, will open new one with next payment and pay diff
-					debtMoved = true
-					t.log.Debug().Int64("packets_num", debt).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("part of the debt moved to pay later, channel is too small")
-				}
-
-				amount := new(big.Int).Mul(big.NewInt(payFor), price)
-				stateAmount := new(big.Int).Add(p.CurrentChannel.LastAmount, amount)
-
-				st := &payments.VirtualChannelState{
-					Amount: tlb.FromNanoTON(stateAmount),
-				}
-				st.Sign(p.CurrentChannel.Key)
-
-				pcs, err := tlb.ToCell(st)
-				if err != nil {
-					return nil, time.Time{}, fmt.Errorf("state to cell failed: %w", err)
-				}
-
-				pi := PaymentInstruction{
-					Key:                 p.CurrentChannel.Key.Public().(ed25519.PublicKey),
-					PaymentChannelState: pcs,
-					Final:               isFinal,
-				}
-
-				if i == len(t.chainTo)-1 {
-					pi.Purpose = PaymentPurposeOut << 32
+				if p.LatestChannelDeadline.After(time.Now()) {
+					instructions = append(instructions, *p.LatestInstruction)
+					skipNewPayment = true
 				} else {
-					pi.Purpose = (PaymentPurposeRoute << 32) | uint64(routeId)
+					// if channel safe deadline is passed, it cannot be accepted, so we will make new payment
+					p.PaidPackets -= p.LatestPacketsPaid
+					p.LatestInstruction = nil
 				}
+			}
 
-				instructions = append(instructions, pi)
-				t.log.Debug().Str("amount", amount.String()).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("adding virtual channel payment state instruction")
+			if !skipNewPayment {
+				prepay := consumedOut
+				if i >= len(t.chainTo) {
+					prepay = consumedIn
+				} else if i == len(t.chainTo)-1 {
+					// out gate
+					prepay = consumedMax
+				}
+				prepay -= p.PaidPackets
+				prepay += t.packetsToPrepay
 
-				// We do it this way for atomicity, because some error may happen during iteration,
-				// and it will produce double spend otherwise.
-				// Channel may still be opened but spend will not happen.
-				mutations = append(mutations, func() {
-					p.PaidPackets += payFor
+				if prepay > t.packetsToPrepay/2 || forcePayments {
+					price := new(big.Int).SetUint64(p.PricePerPacket)
+					if p.CurrentChannel == nil || p.CurrentChannel.SafeDeadline.Before(time.Now()) {
+						regularAmount := new(big.Int).Mul(big.NewInt(t.packetsToPrepay), price)
+						// make capacity enough for ChannelCapacityForNumPayments payments,
+						// but in fact it can be less if intermediate nodes not allow this amount
+						wantCap := new(big.Int).Mul(regularAmount, big.NewInt(ChannelCapacityForNumPayments))
 
-					if isFinal {
-						p.CurrentChannel = nil
-					} else {
-						p.CurrentChannel.LastAmount.Set(stateAmount)
+						var err error
+						if p.CurrentChannel, err = t.openVirtualChannel(p, wantCap); err != nil {
+							return nil, time.Time{}, fmt.Errorf("open virtual channel failed: %w", err)
+						}
 					}
-					p.LatestInstruction = &pi
-				})
-			} else if forceLatest && p.LatestInstruction != nil {
-				instructions = append(instructions, *p.LatestInstruction)
+
+					left := new(big.Int).Sub(p.CurrentChannel.Capacity, p.CurrentChannel.LastAmount)
+
+					isFinal := true
+					payFor := new(big.Int).Div(left, price).Int64()
+					if payFor > prepay {
+						isFinal = false
+						payFor = prepay
+					}
+
+					if debt := prepay - payFor; debt > 0 {
+						// we cannot pay for this in single payment channel, amount is too big, will open new one with next payment and pay diff
+						debtMoved = true
+						t.log.Debug().Int64("packets_num", debt).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("part of the debt moved to pay later, channel is too small")
+					}
+
+					amount := new(big.Int).Mul(big.NewInt(payFor), price)
+					stateAmount := new(big.Int).Add(p.CurrentChannel.LastAmount, amount)
+
+					st := &payments.VirtualChannelState{
+						Amount: tlb.FromNanoTON(stateAmount),
+					}
+					st.Sign(p.CurrentChannel.Key)
+
+					pcs, err := tlb.ToCell(st)
+					if err != nil {
+						return nil, time.Time{}, fmt.Errorf("state to cell failed: %w", err)
+					}
+
+					pi := PaymentInstruction{
+						Key:                 p.CurrentChannel.Key.Public().(ed25519.PublicKey),
+						PaymentChannelState: pcs,
+						Final:               isFinal,
+					}
+
+					if i == len(t.chainTo)-1 {
+						pi.Purpose = PaymentPurposeOut << 32
+					} else {
+						pi.Purpose = (PaymentPurposeRoute << 32) | uint64(routeId)
+					}
+
+					if p.LatestInstruction != nil && forcePayments && p.LatestChannelDeadline.After(time.Now()) {
+						// attach previous payment, in case they were lost after reinit
+						instructions = append(instructions, *p.LatestInstruction)
+					}
+					instructions = append(instructions, pi)
+					t.log.Debug().Str("amount", amount.String()).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("adding virtual channel payment state instruction")
+
+					// We do it this way for atomicity, because some error may happen during iteration,
+					// and it will produce double spend otherwise.
+					// Channel may still be opened but spend will not happen.
+					mutations = append(mutations, func() {
+						p.PaidPackets += payFor
+
+						p.LatestPacketsPaid = payFor
+						p.LatestInstruction = &pi
+						p.LatestChannelDeadline = p.CurrentChannel.SafeDeadline
+						p.LatestPaidOnSeqno = t.controlSeqno // incremented before mutation
+
+						if isFinal {
+							p.CurrentChannel = nil
+						} else {
+							p.CurrentChannel.LastAmount.Set(stateAmount)
+						}
+					})
+				}
 			}
 		}
 
@@ -860,11 +806,9 @@ func (t *RegularOutTunnel) prepareTunnelPayments(forceLatest bool) (*EncryptedMe
 
 	if len(mutations) == 0 {
 		t.log.Debug().Msg("payments not needed")
-
-		return nil, time.Time{}, nil
 	}
 
-	t.paymentSeqno++
+	t.controlSeqno++
 	for _, mutation := range mutations {
 		mutation()
 	}
@@ -910,7 +854,7 @@ func (t *RegularOutTunnel) prepareTunnelPayments(forceLatest bool) (*EncryptedMe
 	atomic.StoreInt64(&t.packetsMinPaidIn, minPaidIn)
 	atomic.StoreInt64(&t.packetsMinPaidOut, minPaidOut)
 
-	t.log.Debug().Uint64("seqno", t.paymentSeqno).Int("size", len(t.currentSendInstructions)).Msg("payment instructions prepared")
+	t.log.Debug().Uint64("seqno", t.controlSeqno).Int("size", len(t.currentSendInstructions)).Msg("control instructions prepared")
 
 	if debtMoved {
 		t.requestPayment()
@@ -1106,25 +1050,20 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 			return fmt.Errorf("incorrect payload type: %T", p)
 		}
 	case PingMeta:
-		if m.Seqno > atomic.LoadUint64(&t.pingSeqnoReceived) {
-			atomic.StoreInt64(&t.lastFullyCheckedAt, time.Now().Unix())
-			atomic.StoreUint64(&t.pingSeqnoReceived, m.Seqno)
-		}
-		return nil
-	case PaymentMeta:
 		for {
-			if sq := atomic.LoadUint64(&t.paymentSeqnoReceived); sq < m.Seqno {
-				if !atomic.CompareAndSwapUint64(&t.paymentSeqnoReceived, sq, m.Seqno) {
+			if sq := atomic.LoadUint64(&t.controlSeqnoReceived); sq < m.Seqno {
+				if !atomic.CompareAndSwapUint64(&t.controlSeqnoReceived, sq, m.Seqno) {
 					continue
 				}
 				atomic.StoreInt64(&t.lastFullyCheckedAt, time.Now().Unix())
-				t.log.Debug().Uint64("seqno", t.paymentSeqnoReceived).Msg("payment confirmed for every node in tunnel")
+				if m.WithPayments {
+					atomic.StoreInt32(&t.paymentsConfirmed, 1)
+					atomic.StoreUint64(&t.controlPaidSeqnoReceived, m.Seqno)
+				}
+				t.log.Debug().Uint64("seqno", m.Seqno).Msg("control message returned successfully")
 			}
 			break
 		}
-		t.markPaidOnce.Do(func() {
-			close(t.paidSignal)
-		})
 		return nil
 	default:
 		return fmt.Errorf("unknown meta type %T", m)
@@ -1148,15 +1087,19 @@ func (t *RegularOutTunnel) WaitForInit(ctx context.Context, events func(string))
 				t.requestPayment()
 				log.Info().Msg("adnl tunnel initialized, waiting payment confirmation...")
 
-				select {
-				case <-ctx.Done():
-					return nil, 0, ctx.Err()
-				case <-t.closerCtx.Done():
-					return nil, 0, t.closerCtx.Err()
-				case <-t.paidSignal:
-					if events != nil {
-						events("Tunnel payments received")
+				for {
+					select {
+					case <-ctx.Done():
+						return nil, 0, ctx.Err()
+					case <-t.closerCtx.Done():
+						return nil, 0, t.closerCtx.Err()
+					case <-time.After(5 * time.Millisecond):
+						if atomic.LoadInt32(&t.paymentsConfirmed) == 0 {
+							continue
+						}
 					}
+
+					break
 				}
 			}
 
@@ -1246,7 +1189,8 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 			Seqno:         atomic.AddUint32(&t.seqnoForward, 1),
 			Payload:       payload,
 		}
-	} else if t.tunnelState > StateTypeConfiguring || p == nil {
+	} else if (t.tunnelState > StateTypeConfiguring &&
+		(!t.usePayments || atomic.LoadInt32(&t.paymentsConfirmed) == 1)) || p == nil {
 		msg, err = t.ReassembleInstructions(&EncryptedMessage{
 			SectionPubKey: t.chainTo[0].Keys.SectionPubKey,
 			Instructions:  t.currentSendInstructions,

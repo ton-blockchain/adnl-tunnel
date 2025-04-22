@@ -32,9 +32,8 @@ func init() {
 	tl.Register(EncryptedMessageCached{}, "adnlTunnel.encryptedMessageCached tunnelPubKey:int256 seqno:int payload:bytes = adnlTunnel.EncryptedMessage")
 	tl.Register(InstructionsContainer{}, "adnlTunnel.instructionsContainer seqno:int list:(vector adnlTunnel.Instruction) = adnlTunnel.InstructionsContainer")
 
-	tl.Register(PaymentMeta{}, "adnlTunnel.paymentMeta seqno:long = adnlTunnel.PaymentMeta")
 	tl.Register(StateMeta{}, "adnlTunnel.stateMeta state:int = adnlTunnel.StateMeta")
-	tl.Register(PingMeta{}, "adnlTunnel.pingMeta seqno:long = adnlTunnel.PingMeta")
+	tl.Register(PingMeta{}, "adnlTunnel.pingMeta seqno:long withPayments:Bool = adnlTunnel.PingMeta")
 
 	tl.Register(SendOutPayload{}, "adnlTunnel.sendOutPayload seqno:long ip:bytes port:int payload:bytes = adnlTunnel.SendOutPayload")
 	tl.Register(DeliverUDPPayload{}, "adnlTunnel.deliverUDPPayload seqno:long ip:bytes port:int payload:bytes = adnlTunnel.DeliverUDPPayload")
@@ -52,12 +51,9 @@ func init() {
 	instructionOpcodes[tl.Register(DeliverInitiatorInstruction{}, "adnlTunnel.deliverInitiatorInstruction from:int metadata:bytes = adnlTunnel.Instruction")] = reflect.TypeOf(DeliverInitiatorInstruction{})
 }
 
-type PaymentMeta struct {
-	Seqno uint64 `tl:"long"`
-}
-
 type PingMeta struct {
-	Seqno uint64 `tl:"long"`
+	Seqno        uint64 `tl:"long"`
+	WithPayments bool   `tl:"bool"`
 }
 
 type StateMeta struct {
@@ -928,8 +924,8 @@ func (o *Out) Send(payload []byte) error {
 	return nil
 }
 
-const LossAcceptablePercent = 15
-const LossAcceptableStartup = 5000
+const LossAcceptablePercent = 0
+const LossAcceptableStartup = 20000
 
 func (o *Out) Listen(g *Gateway, threads int) {
 	pks := make(chan inPacket, 256*1024)
