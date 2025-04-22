@@ -271,6 +271,7 @@ func (t *RegularOutTunnel) startSystemSender() {
 
 	lastTry := time.Time{}
 
+	var forceResendPayments bool
 	var lastPaymentMsg *EncryptedMessage
 	var err error
 	for {
@@ -292,10 +293,9 @@ func (t *RegularOutTunnel) startSystemSender() {
 
 		var lastMsg *EncryptedMessage
 		var paymentDeadline time.Time
-		var forceResendPayments bool
 
 		lastMetaAt := atomic.LoadInt64(&t.lastFullyCheckedAt)
-		if lastMetaAt+int64(CheckEvery/time.Second)*3 < time.Now().Unix() {
+		if lastMetaAt+int64(CheckEvery/time.Second)*10 < time.Now().Unix() {
 			if t.pingSeqno-atomic.LoadUint64(&t.pingSeqnoReceived) > 3 && t.pingSeqno-t.pingSeqnoReinitAt > 3 &&
 				t.tunnelState != StateTypeConfiguring {
 				t.log.Info().Msg("tunnel looks disconnected, trying to reconfigure...")
