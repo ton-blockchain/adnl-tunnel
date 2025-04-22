@@ -30,7 +30,7 @@ type Peer struct {
 	LastPacketFromAt int64
 	LastPacketToAt   int64
 
-	wantDiscoverAt     int64
+	wantDiscover       int32
 	discoverInProgress int32
 
 	closerCtx context.Context
@@ -44,13 +44,12 @@ func (g *Gateway) addPeer(id []byte, conn adnl.Peer) *Peer {
 	if peer == nil {
 		ctx, closer := context.WithCancel(g.closerCtx)
 		peer = &Peer{
-			id:               id,
-			gw:               g,
-			LastPacketFromAt: time.Now().Unix(),
-			CreatedAt:        time.Now().Unix(),
-			LastPacketToAt:   0,
-			closerCtx:        ctx,
-			closer:           closer,
+			id:             id,
+			gw:             g,
+			CreatedAt:      time.Now().Unix(),
+			LastPacketToAt: 0,
+			closerCtx:      ctx,
+			closer:         closer,
 		}
 		g.activePeers[string(id)] = peer
 		log.Debug().Str("peer", base64.StdEncoding.EncodeToString(id)).Msg("new peer connected")
@@ -62,7 +61,7 @@ func (g *Gateway) addPeer(id []byte, conn adnl.Peer) *Peer {
 		conn.SetCustomMessageHandler(g.messageHandler(peer))
 		atomic.StorePointer(&peer.conn, unsafe.Pointer(&connAtomic{conn: conn, addr: conn.RemoteAddr()}))
 	} else {
-		atomic.StoreInt64(&peer.wantDiscoverAt, time.Now().Unix())
+		atomic.StoreInt32(&peer.wantDiscover, 1)
 	}
 	peer.mx.Unlock()
 
@@ -167,7 +166,7 @@ func (p *Peer) Dereference() {
 func (p *Peer) SendCustomMessage(ctx context.Context, req tl.Serializable) error {
 	conn := p.getConn()
 	if conn == nil {
-		atomic.StoreInt64(&p.wantDiscoverAt, time.Now().Unix())
+		atomic.StoreInt32(&p.wantDiscover, 1)
 		return fmt.Errorf("peer is not connected")
 	}
 

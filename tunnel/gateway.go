@@ -315,7 +315,7 @@ func (g *Gateway) keepAlivePeersAndSections() {
 	const SectionMaxInactiveSec = 120
 	const PeerMaxInactiveSec = 15
 
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 
 	for {
 		select {
@@ -328,26 +328,28 @@ func (g *Gateway) keepAlivePeersAndSections() {
 
 			g.mx.RLock()
 			for _, peer := range g.activePeers {
+				g.log.Debug().Int64("refs", atomic.LoadInt64(&peer.references)).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Int64("inactive", tm-peer.LastPacketFromAt).Int32("want_discover", atomic.LoadInt32(&peer.wantDiscover)).Msg("checking peer")
+
 				if atomic.LoadInt64(&peer.references) == 0 && tm-peer.CreatedAt > 10 {
 					peer.kill()
 					continue
 				}
 
-				g.log.Debug().Int64("refs", atomic.LoadInt64(&peer.references)).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Int64("inactive", tm-peer.LastPacketFromAt).Int64("want_discover", peer.wantDiscoverAt).Msg("checking peer")
+				if tm-peer.LastPacketFromAt > PeerMaxInactiveSec {
+					atomic.StoreInt32(&peer.wantDiscover, 1)
+				}
 
-				if tm-peer.LastPacketFromAt > PeerMaxInactiveSec || atomic.LoadInt64(&peer.wantDiscoverAt) >= tm-3 {
-					if atomic.LoadInt32(&peer.discoverInProgress) == 0 && tm-atomic.LoadInt64(&peer.DiscoveredAt) > 15 {
-						peer.closeConn(nil)
-						go func(peer *Peer) {
-							g.log.Debug().Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("discovering peer")
-							ctx, cancel := context.WithTimeout(g.closerCtx, 60*time.Second)
-							err := peer.discover(ctx)
-							cancel()
-							if err != nil {
-								g.log.Debug().Err(err).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("peer discovery failed")
-							}
-						}(peer)
-					}
+				if atomic.LoadInt32(&peer.wantDiscover) != 0 && atomic.LoadInt32(&peer.discoverInProgress) == 0 && tm-atomic.LoadInt64(&peer.DiscoveredAt) > 15 {
+					peer.closeConn(nil)
+					go func(peer *Peer) {
+						g.log.Debug().Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("discovering peer")
+						ctx, cancel := context.WithTimeout(g.closerCtx, 60*time.Second)
+						err := peer.discover(ctx)
+						cancel()
+						if err != nil {
+							g.log.Debug().Err(err).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("peer discovery failed")
+						}
+					}(peer)
 					continue
 				}
 
@@ -492,6 +494,8 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 		}
 
 		atomic.StoreInt64(&peer.LastPacketFromAt, time.Now().Unix())
+		atomic.StoreInt32(&peer.wantDiscover, 0)
+
 		return nil
 	}
 }
