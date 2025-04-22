@@ -313,7 +313,7 @@ func (g *Gateway) Start() error {
 
 func (g *Gateway) keepAlivePeersAndSections() {
 	const SectionMaxInactiveSec = 120
-	const PeerMaxInactiveSec = 15
+	const PeerMaxInactiveSec = 10
 
 	ticker := time.NewTicker(2 * time.Second)
 
@@ -328,19 +328,19 @@ func (g *Gateway) keepAlivePeersAndSections() {
 
 			g.mx.RLock()
 			for _, peer := range g.activePeers {
-				g.log.Debug().Int64("refs", atomic.LoadInt64(&peer.references)).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Int64("inactive", tm-peer.LastPacketFromAt).Int32("want_discover", atomic.LoadInt32(&peer.wantDiscover)).Msg("checking peer")
+				g.log.Debug().Int64("refs", atomic.LoadInt64(&peer.references)).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Int64("inactive", tm-peer.LastPacketFromAt).Bool("connected", peer.getConn() != nil).Msg("checking peer")
 
 				if atomic.LoadInt64(&peer.references) == 0 && tm-peer.CreatedAt > 10 {
 					peer.kill()
 					continue
 				}
 
-				if tm-peer.LastPacketFromAt > PeerMaxInactiveSec {
-					atomic.StoreInt32(&peer.wantDiscover, 1)
+				if tm-peer.LastPacketFromAt > PeerMaxInactiveSec &&
+					tm-atomic.LoadInt64(&peer.DiscoveredAt) > PeerMaxInactiveSec {
+					peer.closeConn(nil)
 				}
 
-				if atomic.LoadInt32(&peer.wantDiscover) != 0 && atomic.LoadInt32(&peer.discoverInProgress) == 0 && tm-atomic.LoadInt64(&peer.DiscoveredAt) > 15 {
-					peer.closeConn(nil)
+				if peer.getConn() == nil && atomic.LoadInt32(&peer.discoverInProgress) == 0 {
 					go func(peer *Peer) {
 						g.log.Debug().Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("discovering peer")
 						ctx, cancel := context.WithTimeout(g.closerCtx, 60*time.Second)
@@ -353,6 +353,7 @@ func (g *Gateway) keepAlivePeersAndSections() {
 					continue
 				}
 
+				g.log.Debug().Int64("refs", atomic.LoadInt64(&peer.references)).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("pinging peer")
 				err := peer.SendCustomMessage(context.Background(), Ping{
 					Seqno: atomic.AddUint64(&peer.pingSeqno, 1),
 				})
@@ -407,9 +408,10 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 			}); err != nil {
 				return fmt.Errorf("send pong failed: %w", err)
 			}
-			g.log.Debug().Msg("ping received")
+			g.log.Debug().Str("peer", base64.StdEncoding.EncodeToString(peer.id)).Str("addr", peer.getAddr()).Msg("ping received")
 		case Pong:
-			g.log.Debug().Msg("pong received")
+			atomic.StoreUint64(&peer.pongSeqno, m.Seqno)
+			g.log.Debug().Str("peer", base64.StdEncoding.EncodeToString(peer.id)).Str("addr", peer.getAddr()).Msg("pong received")
 		case EncryptedMessageCached:
 			g.mx.RLock()
 			sec := g.inboundSections[string(m.SectionPubKey)]
@@ -494,7 +496,6 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 		}
 
 		atomic.StoreInt64(&peer.LastPacketFromAt, time.Now().Unix())
-		atomic.StoreInt32(&peer.wantDiscover, 0)
 
 		return nil
 	}

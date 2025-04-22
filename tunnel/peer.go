@@ -22,6 +22,7 @@ type Peer struct {
 	id         []byte
 	conn       unsafe.Pointer
 	pingSeqno  uint64
+	pongSeqno  uint64
 	references int64
 	gw         *Gateway
 
@@ -30,7 +31,6 @@ type Peer struct {
 	LastPacketFromAt int64
 	LastPacketToAt   int64
 
-	wantDiscover       int32
 	discoverInProgress int32
 
 	closerCtx context.Context
@@ -60,8 +60,6 @@ func (g *Gateway) addPeer(id []byte, conn adnl.Peer) *Peer {
 	if conn != nil {
 		conn.SetCustomMessageHandler(g.messageHandler(peer))
 		atomic.StorePointer(&peer.conn, unsafe.Pointer(&connAtomic{conn: conn, addr: conn.RemoteAddr()}))
-	} else {
-		atomic.StoreInt32(&peer.wantDiscover, 1)
 	}
 	peer.mx.Unlock()
 
@@ -166,7 +164,6 @@ func (p *Peer) Dereference() {
 func (p *Peer) SendCustomMessage(ctx context.Context, req tl.Serializable) error {
 	conn := p.getConn()
 	if conn == nil {
-		atomic.StoreInt32(&p.wantDiscover, 1)
 		return fmt.Errorf("peer is not connected")
 	}
 
