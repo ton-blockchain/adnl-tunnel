@@ -332,7 +332,7 @@ func (g *Gateway) keepAlivePeersAndSections() {
 				g.log.Debug().Int64("refs", atomic.LoadInt64(&peer.references)).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Int64("inactive", tm-peer.LastPacketFromAt).Bool("connected", peer.getConn() != nil).Msg("checking peer")
 
 				if atomic.LoadInt64(&peer.references) == 0 && tm-peer.CreatedAt > 10 {
-					peer.kill()
+					go peer.kill() // async to not get deadlock
 					continue
 				}
 
