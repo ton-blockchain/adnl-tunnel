@@ -273,6 +273,22 @@ func (t *RegularOutTunnel) startControlSender() {
 		}
 		lastTry = time.Now()
 
+		if atomic.LoadUint32(&t.tunnelState) == StateTypeConfiguring {
+			msg, err := t.prepareInitMessage(StateTypeConfiguring)
+			if err != nil {
+				t.log.Error().Err(err).Msg("prepare tunnel init failed")
+				continue
+			}
+
+			if err := t.peer.SendCustomMessage(context.Background(), msg); err != nil {
+				t.log.Error().Err(err).Msg("send tunnel control failed, retrying")
+				continue
+			}
+
+			log.Info().Msg("sending tunnel init message, waiting for confirmation")
+			continue
+		}
+
 		var paidRecvLoss float64
 		var attachPayments = false
 		if t.usePayments && atomic.LoadUint32(&t.tunnelState) == StateTypeOptimized {
@@ -319,7 +335,7 @@ func (t *RegularOutTunnel) startControlSender() {
 			Msg("sending control message")
 
 		if err = t.peer.SendCustomMessage(context.Background(), msg); err != nil {
-			t.log.Error().Err(err).Msg("send tunnel payments failed, retrying")
+			t.log.Error().Err(err).Msg("send tunnel control failed, retrying")
 			continue
 		}
 	}
@@ -856,7 +872,7 @@ func (t *RegularOutTunnel) prepareInitMessage(state uint32) (*EncryptedMessage, 
 						continue
 					}
 
-					if err := buildRoute(state == StateTypeConfiguring, backMsg, t.chainFrom[y], t.chainFrom[y+1], t.usePayments); err != nil {
+					if err := buildRoute(state == StateTypeConfiguring, backMsg, t.chainFrom[y], t.chainFrom[y+1], true); err != nil {
 						return nil, fmt.Errorf("build route %d failed: %w", y, err)
 					}
 				}
@@ -901,13 +917,13 @@ func (t *RegularOutTunnel) prepareInitMessage(state uint32) (*EncryptedMessage, 
 			continue
 		}
 
-		if err := buildRoute(state == StateTypeConfiguring, msg, t.chainTo[i], t.chainTo[i+1], t.usePayments); err != nil {
+		if err := buildRoute(state == StateTypeConfiguring, msg, t.chainTo[i], t.chainTo[i+1], true); err != nil {
 			return nil, fmt.Errorf("build route %d failed: %w", i, err)
 		}
 	}
 
 	atomic.StoreUint32(&t.tunnelState, state)
-	t.log.Debug().Uint32("state", state).Msg("init message prepared updated")
+	t.log.Debug().Uint32("state", state).Msg("init message prepared")
 
 	return msg, nil
 }
@@ -940,11 +956,15 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 			case StateTypeOptimizingRoutes:
 				atomic.StoreUint32(&t.tunnelState, StateTypeOptimized)
 
-				t.log.Info().Msg("route optimized, ready to use")
-				t.requestControlMessage()
+				if atomic.CompareAndSwapUint32(&t.tunnelState, StateTypeOptimizingRoutes, StateTypeOptimized) {
+					t.log.Info().Msg("route optimized, ready to use")
+					t.requestControlMessage()
+				}
 			default:
 				return fmt.Errorf("unknown tunnel state: %d", currentState)
 			}
+
+			atomic.StoreInt64(&t.lastFullyCheckedAt, time.Now().Unix())
 		}
 
 		switch p := data.(type) {
