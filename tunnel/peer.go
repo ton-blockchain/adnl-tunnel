@@ -30,6 +30,7 @@ type Peer struct {
 	DiscoveredAt     int64
 	LastPacketFromAt int64
 	LastPacketToAt   int64
+	LastPingSentAt   int64
 
 	discoverInProgress int32
 
@@ -63,6 +64,11 @@ func (g *Gateway) addPeer(id []byte, conn adnl.Peer) *Peer {
 		atomic.StoreInt64(&peer.DiscoveredAt, time.Now().Unix())
 	}
 	peer.mx.Unlock()
+
+	if conn == nil {
+		// try discover
+		go peer.discover(context.Background())
+	}
 
 	return peer
 }

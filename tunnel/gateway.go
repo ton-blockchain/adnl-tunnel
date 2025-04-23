@@ -145,6 +145,8 @@ type Gateway struct {
 
 	activePeers map[string]*Peer
 
+	signalCheckPeers chan struct{}
+
 	closerCtx context.Context
 	close     func()
 
@@ -188,19 +190,20 @@ type PaymentConfig struct {
 func NewGateway(gate *adnl.Gateway, dht *dht.Client, key ed25519.PrivateKey, logger zerolog.Logger, pay PaymentConfig) *Gateway {
 	ctx, cancel := context.WithCancel(context.Background())
 	g := &Gateway{
-		gate:            gate,
-		key:             key,
-		dht:             dht,
-		allowRouting:    true,
-		allowOut:        true,
-		paymentNode:     nil,
-		activePeers:     map[string]*Peer{},
-		closerCtx:       ctx,
-		close:           cancel,
-		tunnels:         map[uint32]Tunnel{},
-		log:             logger,
-		payments:        pay,
-		inboundSections: map[string]*Section{},
+		gate:             gate,
+		key:              key,
+		dht:              dht,
+		allowRouting:     true,
+		allowOut:         true,
+		paymentNode:      nil,
+		activePeers:      map[string]*Peer{},
+		signalCheckPeers: make(chan struct{}, 1),
+		closerCtx:        ctx,
+		close:            cancel,
+		tunnels:          map[uint32]Tunnel{},
+		log:              logger,
+		payments:         pay,
+		inboundSections:  map[string]*Section{},
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				return make([]byte, 2048)
@@ -222,6 +225,13 @@ type SectionStats struct {
 	PrepaidPacketsRoute []int64
 	PrepaidPacketsIn    int64
 	PrepaidPacketsOut   int64
+}
+
+func (g *Gateway) requestCheckPeers() {
+	select {
+	case g.signalCheckPeers <- struct{}{}:
+	default:
+	}
 }
 
 func (g *Gateway) GetPacketsStats() map[string]*SectionStats {
@@ -316,7 +326,7 @@ func (g *Gateway) keepAlivePeersAndSections() {
 	const SectionMaxInactiveSec = 120
 	const PeerMaxInactiveSec = 10
 
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
 
 	for {
 		select {
@@ -329,7 +339,7 @@ func (g *Gateway) keepAlivePeersAndSections() {
 
 			g.mx.RLock()
 			for _, peer := range g.activePeers {
-				g.log.Debug().Int64("refs", atomic.LoadInt64(&peer.references)).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Int64("inactive", tm-peer.LastPacketFromAt).Bool("connected", peer.getConn() != nil).Msg("checking peer")
+				g.log.Trace().Int64("refs", atomic.LoadInt64(&peer.references)).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Int64("inactive", tm-peer.LastPacketFromAt).Bool("connected", peer.getConn() != nil).Msg("checking peer")
 
 				if atomic.LoadInt64(&peer.references) == 0 && tm-peer.CreatedAt > 10 {
 					go peer.kill() // async to not get deadlock
@@ -356,12 +366,15 @@ func (g *Gateway) keepAlivePeersAndSections() {
 					continue
 				}
 
-				g.log.Debug().Int64("refs", atomic.LoadInt64(&peer.references)).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("pinging peer")
-				err := peer.SendCustomMessage(context.Background(), Ping{
-					Seqno: atomic.AddUint64(&peer.pingSeqno, 1),
-				})
-				if err != nil {
-					continue
+				if tm-peer.LastPingSentAt > 3 {
+					peer.LastPingSentAt = tm
+					g.log.Debug().Int64("refs", atomic.LoadInt64(&peer.references)).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("pinging peer")
+					err := peer.SendCustomMessage(context.Background(), Ping{
+						Seqno: atomic.AddUint64(&peer.pingSeqno, 1),
+					})
+					if err != nil {
+						continue
+					}
 				}
 			}
 
