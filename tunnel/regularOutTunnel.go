@@ -281,7 +281,11 @@ func (t *RegularOutTunnel) startControlSender() {
 			}
 
 			if err := t.peer.SendCustomMessage(context.Background(), msg); err != nil {
-				t.log.Error().Err(err).Msg("send tunnel control failed, retrying")
+				if errors.Is(err, ErrNotConnected) {
+					t.log.Debug().Msg("peer not yet connected, retrying")
+					continue
+				}
+				t.log.Error().Err(err).Msg("send tunnel init failed, retrying")
 				continue
 			}
 
@@ -291,40 +295,43 @@ func (t *RegularOutTunnel) startControlSender() {
 
 		var paidRecvLoss float64
 		var attachPayments = false
-		if t.usePayments && atomic.LoadUint32(&t.tunnelState) == StateTypeOptimized {
-			received := atomic.LoadUint64(&t.packetsRecv)
-			paidUsed := atomic.LoadUint64(&t.packetsRecvPaidConsumed)
 
-			// attaching payments only after checking that tunnel works
-			attachPayments = t.controlSeqno > 0 && t.controlSeqno == t.controlSeqnoReceived
-			if attachPayments {
-				const LossNumAcceptable = 5000 // + 33%
-				if paidUsed > received+received/3+LossNumAcceptable {
-					attachPayments = false
-					// TODO: reinit something instead, with a new tunnel
-					t.log.Warn().Uint64("seqno", atomic.LoadUint64(&t.seqnoRecv)).Uint64("received", received).Msg("more than 33% incoming packets lost according to seqno, very unstable network or tunnel seems trying to cheat to get more payments")
+		if atomic.LoadUint32(&t.tunnelState) == StateTypeOptimized {
+			if time.Now().Unix()-atomic.LoadInt64(&t.lastFullyCheckedAt) > 15 {
+				t.log.Info().Msg("tunnel looks disconnected, trying to reconfigure...")
+
+				// try to reconfigure tunnel in case server restart on one of the nodes on the way
+				if t.usePayments {
+					atomic.StoreInt32(&t.paymentsConfirmed, 0)
 				}
+				atomic.StoreUint32(&t.tunnelState, StateTypeConfiguring)
+
+				t.requestControlMessage()
+				continue
 			}
 
-			paidRecvLoss = float64(paidUsed-received) / float64(paidUsed)
+			if t.usePayments {
+				received := atomic.LoadUint64(&t.packetsRecv)
+				paidUsed := atomic.LoadUint64(&t.packetsRecvPaidConsumed)
+
+				// attaching payments only after checking that tunnel works
+				attachPayments = t.controlSeqno > 0 && t.controlSeqno == t.controlSeqnoReceived
+				if attachPayments {
+					const LossNumAcceptable = 5000 // + 33%
+					if paidUsed > received+received/3+LossNumAcceptable {
+						attachPayments = false
+						// TODO: reinit something instead, with a new tunnel
+						t.log.Warn().Uint64("seqno", atomic.LoadUint64(&t.seqnoRecv)).Uint64("received", received).Msg("more than 33% incoming packets lost according to seqno, very unstable network or tunnel seems trying to cheat to get more payments")
+					}
+				}
+
+				paidRecvLoss = float64(paidUsed-received) / float64(paidUsed)
+			}
 		}
 
 		msg, _, err := t.prepareTunnelControlMessage(attachPayments, atomic.LoadInt32(&t.paymentsConfirmed) == 0)
 		if err != nil {
 			t.log.Error().Err(err).Msg("prepare tunnel pings failed")
-			continue
-		}
-
-		if time.Now().Unix()-atomic.LoadInt64(&t.lastFullyCheckedAt) > 15 && atomic.LoadUint32(&t.tunnelState) == StateTypeOptimized {
-			t.log.Info().Msg("tunnel looks disconnected, trying to reconfigure...")
-
-			// try to reconfigure tunnel in case server restart on one of the nodes on the way
-			if t.usePayments {
-				atomic.StoreInt32(&t.paymentsConfirmed, 0)
-			}
-			atomic.StoreUint32(&t.tunnelState, StateTypeConfiguring)
-
-			t.requestControlMessage()
 			continue
 		}
 
@@ -675,9 +682,10 @@ func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePaymen
 				if p.LatestChannelDeadline.After(time.Now()) {
 					instructions = append(instructions, *p.LatestInstruction)
 					skipNewPayment = true
+					t.log.Debug().Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("adding latest virtual channel payment state instruction, to resend")
 				} else {
 					// if channel safe deadline is passed, it cannot be accepted, so we will make new payment
-					log.Debug().Str("channel_key", base64.StdEncoding.EncodeToString(p.LatestInstruction.Key)).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("channel safe deadline passed, will make new payment")
+					log.Warn().Str("channel_key", base64.StdEncoding.EncodeToString(p.LatestInstruction.Key)).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("payment channel expired, will make a new payment")
 					p.LatestInstruction = nil
 					p.PaidPackets -= p.LatestPacketsPaid
 				}
@@ -748,9 +756,11 @@ func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePaymen
 						pi.Purpose = (PaymentPurposeRoute << 32) | uint64(routeId)
 					}
 
-					if p.LatestInstruction != nil && forcePayments && p.LatestChannelDeadline.After(time.Now()) {
-						// attach previous payment, in case they were lost after reinit
+					if forcePayments && p.LatestInstruction != nil &&
+						p.LatestChannelDeadline.After(time.Now()) && !p.LatestChannelDeadline.Equal(p.CurrentChannel.SafeDeadline) {
+						// attach previous payment, in case they were lost after reinit (if this payment related to prev channel)
 						instructions = append(instructions, *p.LatestInstruction)
+						t.log.Debug().Str("amount", amount.String()).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("adding previous virtual channel payment state instruction")
 					}
 					instructions = append(instructions, pi)
 					t.log.Debug().Str("amount", amount.String()).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("adding virtual channel payment state instruction")
@@ -766,10 +776,9 @@ func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePaymen
 						p.LatestChannelDeadline = p.CurrentChannel.SafeDeadline
 						p.LatestPaidOnSeqno = t.controlSeqno // incremented before mutation
 
+						p.CurrentChannel.LastAmount.Set(stateAmount)
 						if isFinal {
 							p.CurrentChannel = nil
-						} else {
-							p.CurrentChannel.LastAmount.Set(stateAmount)
 						}
 					})
 				}
@@ -1011,24 +1020,22 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 			t.mx.Lock()
 			defer t.mx.Unlock()
 
-			if atomic.CompareAndSwapInt32(&t.outConfigured, 0, 1) {
-				if t.externalAddr.Equal(p.IP) && t.externalPort == uint16(p.Port) {
-					return nil
-				}
-
-				t.externalAddr = p.IP
-				t.externalPort = uint16(p.Port)
-
-				if f := t.onOutAddressChanged; f != nil {
-					f(&net.UDPAddr{
-						IP:   p.IP,
-						Port: int(p.Port),
-					})
-				}
-
-				t.log.Info().Str("ip", net.IP(p.IP).String()).Uint32("port", p.Port).Msg("out gateway updated")
+			if t.externalAddr.Equal(p.IP) && t.externalPort == uint16(p.Port) {
+				return nil
 			}
 
+			t.externalAddr = p.IP
+			t.externalPort = uint16(p.Port)
+
+			if f := t.onOutAddressChanged; f != nil {
+				f(&net.UDPAddr{
+					IP:   p.IP,
+					Port: int(p.Port),
+				})
+			}
+
+			t.log.Info().Str("ip", net.IP(p.IP).String()).Uint32("port", p.Port).Msg("out gateway updated")
+			
 			return nil
 		default:
 			return fmt.Errorf("incorrect payload type: %T", p)
@@ -1043,7 +1050,7 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 
 				if m.WithPayments {
 					if atomic.CompareAndSwapInt32(&t.paymentsConfirmed, 0, 1) {
-						t.log.Info().Msg("payments confirmed")
+						t.log.Info().Uint64("seqno", m.Seqno).Msg("initiating payments confirmed")
 					}
 					atomic.StoreUint64(&t.controlPaidSeqnoReceived, m.Seqno)
 				}

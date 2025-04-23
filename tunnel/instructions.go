@@ -346,7 +346,7 @@ func (r *Route) Route(ctx context.Context, payload []byte, cached bool, instruct
 		}
 
 		if !paid && r.rate.Add(1) <= 0 {
-			return fmt.Errorf("free packets exceeds rate limit")
+			return fmt.Errorf("free packets exceeds rate limit for route %d", r.ID)
 		}
 	}
 
@@ -738,6 +738,7 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 				Uint16("port", port).
 				Str("back_route_adnl", base64.StdEncoding.EncodeToString(ins.InboundNodeADNL)).
 				Int("size", len(ins.InboundInstructions)).
+				Uint64("crc", crc64.Checksum(ins.InboundInstructions, crcTable)).
 				Msg("out addr reconfigured")
 		}
 		s.out.mx.Unlock()

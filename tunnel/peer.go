@@ -168,10 +168,12 @@ func (p *Peer) Dereference() {
 	}
 }
 
+var ErrNotConnected = fmt.Errorf("peer is not connected")
+
 func (p *Peer) SendCustomMessage(ctx context.Context, req tl.Serializable) error {
 	conn := p.getConn()
 	if conn == nil {
-		return fmt.Errorf("peer is not connected")
+		return ErrNotConnected
 	}
 
 	atomic.StoreInt64(&p.LastPacketToAt, time.Now().Unix())
