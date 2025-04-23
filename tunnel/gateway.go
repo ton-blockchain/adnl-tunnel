@@ -411,10 +411,10 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 			}); err != nil {
 				return fmt.Errorf("send pong failed: %w", err)
 			}
-			g.log.Debug().Str("peer", base64.StdEncoding.EncodeToString(peer.id)).Str("addr", peer.getAddr()).Msg("ping received")
+			g.log.Trace().Str("peer", base64.StdEncoding.EncodeToString(peer.id)).Str("addr", peer.getAddr()).Msg("ping received")
 		case Pong:
 			atomic.StoreUint64(&peer.pongSeqno, m.Seqno)
-			g.log.Debug().Str("peer", base64.StdEncoding.EncodeToString(peer.id)).Str("addr", peer.getAddr()).Msg("pong received")
+			g.log.Trace().Str("peer", base64.StdEncoding.EncodeToString(peer.id)).Str("addr", peer.getAddr()).Msg("pong received")
 		case EncryptedMessageCached:
 			g.mx.RLock()
 			sec := g.inboundSections[string(m.SectionPubKey)]

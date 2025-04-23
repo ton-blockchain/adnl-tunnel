@@ -75,11 +75,10 @@ type RegularOutTunnel struct {
 	peer              *Peer
 	usePayments       bool
 	paymentsConfirmed int32
+	outConfigured     int32
 
 	tunnelState       uint32
-	tunnelInitialized bool
-	initSignal        chan struct{}
-	paySignal         chan struct{}
+	sendControlSignal chan struct{}
 	externalAddr      net.IP
 	externalPort      uint16
 
@@ -91,7 +90,6 @@ type RegularOutTunnel struct {
 
 	read chan DeliverUDPPayload
 
-	currentSendInstructions []byte
 	seqnoSend               uint64
 	seqnoRecv               uint64
 	packetsRecv             uint64
@@ -102,7 +100,6 @@ type RegularOutTunnel struct {
 	controlSeqno             uint64
 	controlSeqnoReceived     uint64
 	controlPaidSeqnoReceived uint64
-	controlSeqnoReinitAt     uint64
 
 	packetsToPrepay int64
 
@@ -127,8 +124,6 @@ type RegularOutTunnel struct {
 
 	mx sync.RWMutex
 }
-
-var initAddr = net.UDPAddrFromAddrPort(netip.MustParseAddrPort("0.0.0.1:123"))
 
 var ChannelCapacityForNumPayments int64 = 30
 var ChannelPacketsToPrepay int64 = 200000
@@ -163,8 +158,7 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 		chainTo:            chainTo,
 		chainFrom:          chainFrom,
 		payloadKeys:        pec,
-		initSignal:         make(chan struct{}, 1),
-		paySignal:          make(chan struct{}, 1),
+		sendControlSignal:  make(chan struct{}, 1),
 		read:               make(chan DeliverUDPPayload, 512*1024),
 		localAddr:          net.UDPAddrFromAddrPort(ap),
 		tunnelState:        StateTypeConfiguring,
@@ -190,10 +184,6 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 	}
 
 	go rt.startControlSender()
-
-	if err = rt.prepareInstructions(StateTypeConfiguring); err != nil {
-		return nil, fmt.Errorf("prepare initial instructions failed: %w", err)
-	}
 
 	g.mx.Lock()
 	g.tunnels[binary.LittleEndian.Uint32(rt.payloadKeys.SectionPubKey)] = rt
@@ -260,25 +250,20 @@ func (t *RegularOutTunnel) SetOutAddressChangedHandler(f func(addr *net.UDPAddr)
 }
 
 func (t *RegularOutTunnel) startControlSender() {
-	select {
-	case <-t.closerCtx.Done():
-		return
-	case <-t.initSignal:
-	}
-
 	const CheckEvery = 1 * time.Second
 
 	ticker := time.NewTicker(CheckEvery)
 
 	lastTry := time.Time{}
 
+	t.requestControlMessage()
 	for {
 		ticker.Reset(CheckEvery)
 
 		select {
 		case <-t.closerCtx.Done():
 			return
-		case <-t.paySignal:
+		case <-t.sendControlSignal:
 		case <-ticker.C:
 		}
 
@@ -290,7 +275,7 @@ func (t *RegularOutTunnel) startControlSender() {
 
 		var paidRecvLoss float64
 		var attachPayments = false
-		if t.usePayments {
+		if t.usePayments && atomic.LoadUint32(&t.tunnelState) == StateTypeOptimized {
 			received := atomic.LoadUint64(&t.packetsRecv)
 			paidUsed := atomic.LoadUint64(&t.packetsRecvPaidConsumed)
 
@@ -308,43 +293,22 @@ func (t *RegularOutTunnel) startControlSender() {
 			paidRecvLoss = float64(paidUsed-received) / float64(paidUsed)
 		}
 
-		lastMsg, _, err := t.prepareTunnelControlMessage(attachPayments, atomic.LoadInt32(&t.paymentsConfirmed) == 0)
+		msg, _, err := t.prepareTunnelControlMessage(attachPayments, atomic.LoadInt32(&t.paymentsConfirmed) == 0)
 		if err != nil {
 			t.log.Error().Err(err).Msg("prepare tunnel pings failed")
 			continue
 		}
 
-		if time.Now().Unix()-atomic.LoadInt64(&t.lastFullyCheckedAt) > 15 {
+		if time.Now().Unix()-atomic.LoadInt64(&t.lastFullyCheckedAt) > 15 && atomic.LoadUint32(&t.tunnelState) == StateTypeOptimized {
 			t.log.Info().Msg("tunnel looks disconnected, trying to reconfigure...")
 
 			// try to reconfigure tunnel in case server restart on one of the nodes on the way
-			if err = t.prepareInstructions(StateTypeConfiguring); err != nil {
-				t.log.Error().Err(err).Msg("prepare tunnel reconfigure instructions failed")
-				continue
+			if t.usePayments {
+				atomic.StoreInt32(&t.paymentsConfirmed, 0)
 			}
+			atomic.StoreUint32(&t.tunnelState, StateTypeConfiguring)
 
-			t.controlSeqnoReinitAt = t.controlSeqno
-			atomic.StoreInt32(&t.paymentsConfirmed, 0)
-
-			for {
-				t.log.Info().Msg("sending tunnel reinit")
-
-				if _, err := t.WriteTo(nil, initAddr); err != nil {
-					t.log.Error().Err(err).Msg("write to reconfigure tunnel failed")
-					continue
-				}
-
-				select {
-				case <-t.closerCtx.Done():
-					return
-				case <-ticker.C:
-				}
-
-				if t.tunnelState > StateTypeConfiguring {
-					t.log.Info().Msg("tunnel reinitialized successfully")
-					break
-				}
-			}
+			t.requestControlMessage()
 			continue
 		}
 
@@ -354,7 +318,7 @@ func (t *RegularOutTunnel) startControlSender() {
 			Int64("in_left", atomic.LoadInt64(&t.packetsMinPaidIn)-atomic.LoadInt64(&t.packetsConsumedIn)).
 			Msg("sending control message")
 
-		if err = t.peer.SendCustomMessage(context.Background(), lastMsg); err != nil {
+		if err = t.peer.SendCustomMessage(context.Background(), msg); err != nil {
 			t.log.Error().Err(err).Msg("send tunnel payments failed, retrying")
 			continue
 		}
@@ -697,8 +661,9 @@ func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePaymen
 					skipNewPayment = true
 				} else {
 					// if channel safe deadline is passed, it cannot be accepted, so we will make new payment
-					p.PaidPackets -= p.LatestPacketsPaid
+					log.Debug().Str("channel_key", base64.StdEncoding.EncodeToString(p.LatestInstruction.Key)).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("channel safe deadline passed, will make new payment")
 					p.LatestInstruction = nil
+					p.PaidPackets -= p.LatestPacketsPaid
 				}
 			}
 
@@ -854,21 +819,20 @@ func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePaymen
 	atomic.StoreInt64(&t.packetsMinPaidIn, minPaidIn)
 	atomic.StoreInt64(&t.packetsMinPaidOut, minPaidOut)
 
-	t.log.Debug().Uint64("seqno", t.controlSeqno).Int("size", len(t.currentSendInstructions)).Msg("control instructions prepared")
+	t.log.Debug().Uint64("seqno", t.controlSeqno).Msg("control instructions prepared")
 
 	if debtMoved {
-		t.requestPayment()
+		t.requestControlMessage()
 	}
 
 	return msg, minDeadline, nil
 }
 
-func (t *RegularOutTunnel) prepareInstructions(state uint32) error {
+func (t *RegularOutTunnel) prepareInitMessage(state uint32) (*EncryptedMessage, error) {
 	msg := &EncryptedMessage{}
 
 	for i := len(t.chainTo) - 1; i >= 0; i-- {
 		if i == len(t.chainTo)-1 { // last (out gate)
-
 			if state <= StateTypeOptimizingRoutes {
 				backMsg := &EncryptedMessage{}
 
@@ -886,20 +850,20 @@ func (t *RegularOutTunnel) prepareInstructions(state uint32) error {
 							Version:      uint32(time.Now().Unix()),
 							Instructions: []any{ins},
 						}); err != nil {
-							return fmt.Errorf("encrypt layer %d failed: %w", i, err)
+							return nil, fmt.Errorf("encrypt layer %d failed: %w", i, err)
 						}
 
 						continue
 					}
 
 					if err := buildRoute(state == StateTypeConfiguring, backMsg, t.chainFrom[y], t.chainFrom[y+1], t.usePayments); err != nil {
-						return fmt.Errorf("build route %d failed: %w", y, err)
+						return nil, fmt.Errorf("build route %d failed: %w", y, err)
 					}
 				}
 
 				id, err := tl.Hash(adnl.PublicKeyED25519{Key: t.chainFrom[0].Keys.ReceiverPubKey})
 				if err != nil {
-					return fmt.Errorf("calc receiver adnl id failed: %w", err)
+					return nil, fmt.Errorf("calc receiver adnl id failed: %w", err)
 				}
 
 				var price uint64
@@ -921,8 +885,8 @@ func (t *RegularOutTunnel) prepareInstructions(state uint32) error {
 				}, CacheInstruction{
 					Version:      uint32(time.Now().Unix()),
 					Instructions: []any{SendOutInstruction{}},
-				}, SendOutInstruction{}); err != nil {
-					return fmt.Errorf("encrypt bind out failed: %w", err)
+				}); err != nil {
+					return nil, fmt.Errorf("encrypt bind out failed: %w", err)
 				}
 				continue
 			}
@@ -930,24 +894,22 @@ func (t *RegularOutTunnel) prepareInstructions(state uint32) error {
 			if err := t.chainTo[i].Keys.EncryptInstructionsMessage(msg, CacheInstruction{
 				Version:      uint32(time.Now().Unix()),
 				Instructions: []any{SendOutInstruction{}},
-			}, SendOutInstruction{}); err != nil {
-				return fmt.Errorf("encrypt send out failed: %w", err)
+			}); err != nil {
+				return nil, fmt.Errorf("encrypt send out failed: %w", err)
 			}
 
 			continue
 		}
 
 		if err := buildRoute(state == StateTypeConfiguring, msg, t.chainTo[i], t.chainTo[i+1], t.usePayments); err != nil {
-			return fmt.Errorf("build route %d failed: %w", i, err)
+			return nil, fmt.Errorf("build route %d failed: %w", i, err)
 		}
 	}
 
-	t.currentSendInstructions = msg.Instructions
-	t.tunnelState = state
+	atomic.StoreUint32(&t.tunnelState, state)
+	t.log.Debug().Uint32("state", state).Msg("init message prepared updated")
 
-	t.log.Debug().Int("size", len(t.currentSendInstructions)).Msg("instructions updated")
-
-	return nil
+	return msg, nil
 }
 
 func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
@@ -958,26 +920,31 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 			return fmt.Errorf("decryptRecvPayload failed: %v", err)
 		}
 
-		// optimizing instructions size
-		switch m.State {
-		case StateTypeConfiguring:
-			if t.tunnelState < StateTypeOptimizingRoutes {
-				if err = t.prepareInstructions(StateTypeOptimizingRoutes); err != nil {
+		currentState := atomic.LoadUint32(&t.tunnelState)
+		if currentState < StateTypeOptimized {
+			switch m.State {
+			case StateTypeConfiguring:
+				msg, err := t.prepareInitMessage(StateTypeOptimizingRoutes)
+				if err != nil {
 					return fmt.Errorf("prepare optimized instructions failed: %w", err)
 				}
 
-				t.log.Info().Int("size", len(t.currentSendInstructions)).Msg("tunnel configured")
-			}
-		case StateTypeOptimizingRoutes:
-			if t.tunnelState < StateTypeOptimized {
-				if err = t.prepareInstructions(StateTypeOptimized); err != nil {
-					return fmt.Errorf("prepare optimized instructions failed: %w", err)
+				if atomic.CompareAndSwapUint32(&t.tunnelState, StateTypeConfiguring, StateTypeOptimizingRoutes) {
+					t.log.Info().Msg("configuration message received, optimizing routes")
 				}
 
-				t.log.Info().Int("size", len(t.currentSendInstructions)).Msg("tunnel optimizations completed")
+				// TODO: do not send on every packet
+				if err = t.peer.SendCustomMessage(context.Background(), msg); err != nil {
+					return fmt.Errorf("send init message failed: %w", err)
+				}
+			case StateTypeOptimizingRoutes:
+				atomic.StoreUint32(&t.tunnelState, StateTypeOptimized)
+
+				t.log.Info().Msg("route optimized, ready to use")
+				t.requestControlMessage()
+			default:
+				return fmt.Errorf("unknown tunnel state: %d", currentState)
 			}
-		default:
-			return fmt.Errorf("unknown tunnel state: %d", m.State)
 		}
 
 		switch p := data.(type) {
@@ -1007,7 +974,7 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 
 				paid := atomic.LoadInt64(&t.packetsMinPaidIn)
 				if paid-atomic.AddInt64(&t.packetsConsumedIn, int64(seqnoDiff)) < t.packetsToPrepay/2 {
-					t.requestPayment()
+					t.requestControlMessage()
 				}
 			}
 
@@ -1024,25 +991,22 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 			t.mx.Lock()
 			defer t.mx.Unlock()
 
-			if t.externalAddr.Equal(p.IP) && t.externalPort == uint16(p.Port) {
-				return nil
-			}
+			if atomic.CompareAndSwapInt32(&t.outConfigured, 0, 1) {
+				if t.externalAddr.Equal(p.IP) && t.externalPort == uint16(p.Port) {
+					return nil
+				}
 
-			t.externalAddr = p.IP
-			t.externalPort = uint16(p.Port)
+				t.externalAddr = p.IP
+				t.externalPort = uint16(p.Port)
 
-			t.log.Info().Str("ip", net.IP(p.IP).String()).Uint32("port", p.Port).Msg("out gateway updated")
-
-			if !t.tunnelInitialized {
-				t.tunnelInitialized = true
-				close(t.initSignal)
-			} else {
 				if f := t.onOutAddressChanged; f != nil {
 					f(&net.UDPAddr{
 						IP:   p.IP,
 						Port: int(p.Port),
 					})
 				}
+
+				t.log.Info().Str("ip", net.IP(p.IP).String()).Uint32("port", p.Port).Msg("out gateway updated")
 			}
 
 			return nil
@@ -1056,11 +1020,25 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 					continue
 				}
 				atomic.StoreInt64(&t.lastFullyCheckedAt, time.Now().Unix())
+
 				if m.WithPayments {
-					atomic.StoreInt32(&t.paymentsConfirmed, 1)
+					if atomic.CompareAndSwapInt32(&t.paymentsConfirmed, 0, 1) {
+						t.log.Info().Msg("payments confirmed")
+					}
 					atomic.StoreUint64(&t.controlPaidSeqnoReceived, m.Seqno)
 				}
 				t.log.Debug().Uint64("seqno", m.Seqno).Msg("control message returned successfully")
+
+				if atomic.LoadUint32(&t.tunnelState) == StateTypeConfiguring {
+					msg, err := t.prepareInitMessage(StateTypeConfiguring)
+					if err != nil {
+						return fmt.Errorf("prepare init message failed: %w", err)
+					}
+
+					if err = t.peer.SendCustomMessage(context.Background(), msg); err != nil {
+						return fmt.Errorf("send init message failed: %w", err)
+					}
+				}
 			}
 			break
 		}
@@ -1071,20 +1049,23 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 }
 
 func (t *RegularOutTunnel) WaitForInit(ctx context.Context, events func(string)) (net.IP, uint16, error) {
-	var after time.Duration = 0
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, 0, ctx.Err()
 		case <-t.closerCtx.Done():
 			return nil, 0, t.closerCtx.Err()
-		case <-t.initSignal:
+		case <-time.After(5 * time.Millisecond):
+			if atomic.LoadUint32(&t.tunnelState) != StateTypeOptimized {
+				continue
+			}
+
 			if t.usePayments {
 				if events != nil {
 					events("Tunnel configured, waiting payments...")
 				}
 
-				t.requestPayment()
+				t.requestControlMessage()
 				log.Info().Msg("adnl tunnel initialized, waiting payment confirmation...")
 
 				for {
@@ -1107,11 +1088,6 @@ func (t *RegularOutTunnel) WaitForInit(ctx context.Context, events func(string))
 				events("Tunnel initialized")
 			}
 			return t.externalAddr, t.externalPort, nil
-		case <-time.After(after):
-			if _, err := t.WriteTo(nil, initAddr); err != nil {
-				log.Warn().Err(err).Msg("write initial instructions failed, retrying in 1 second...")
-			}
-			after = 1 * time.Second
 		}
 	}
 }
@@ -1136,19 +1112,24 @@ func (t *RegularOutTunnel) ReadFromWithTimeout(ctx context.Context, p []byte) (n
 	}
 }
 
-func (t *RegularOutTunnel) requestPayment() {
+func (t *RegularOutTunnel) requestControlMessage() {
 	select {
-	case t.paySignal <- struct{}{}:
+	case t.sendControlSignal <- struct{}{}:
 	default:
 	}
 }
 
 func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if len(t.currentSendInstructions) == 0 {
-		return -1, fmt.Errorf("send instructions is empty")
+	if len(p) == 0 {
+		return 0, nil
 	}
 
-	if t.usePayments && p != nil {
+	state := atomic.LoadUint32(&t.tunnelState)
+	if state < StateTypeOptimized {
+		return -1, fmt.Errorf("tunnel is not yet ready for sending")
+	}
+
+	if t.usePayments {
 		paid := atomic.LoadInt64(&t.packetsMinPaidOut)
 		consumed := atomic.LoadInt64(&t.packetsConsumedOut)
 		if paid < consumed {
@@ -1156,7 +1137,7 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		}
 
 		if paid-atomic.AddInt64(&t.packetsConsumedOut, 1) < t.packetsToPrepay/2 {
-			t.requestPayment()
+			t.requestControlMessage()
 		}
 	}
 
@@ -1182,28 +1163,11 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return -1, fmt.Errorf("encrypt payload error: %w", err)
 	}
 
-	var msg tl.Serializable
-	if t.tunnelState >= StateTypeOptimized {
-		msg = &EncryptedMessageCached{
-			SectionPubKey: t.chainTo[0].Keys.SectionPubKey,
-			Seqno:         atomic.AddUint32(&t.seqnoForward, 1),
-			Payload:       payload,
-		}
-	} else if (t.tunnelState > StateTypeConfiguring &&
-		(!t.usePayments || atomic.LoadInt32(&t.paymentsConfirmed) == 1)) || p == nil {
-		msg, err = t.ReassembleInstructions(&EncryptedMessage{
-			SectionPubKey: t.chainTo[0].Keys.SectionPubKey,
-			Instructions:  t.currentSendInstructions,
-			Payload:       payload,
-		})
-		if err != nil {
-			return -1, fmt.Errorf("reassemble instructions error: %w", err)
-		}
-	} else {
-		return -1, fmt.Errorf("route is not yet configured")
-	}
-
-	if err = t.peer.SendCustomMessage(context.Background(), msg); err != nil {
+	if err = t.peer.SendCustomMessage(context.Background(), EncryptedMessageCached{
+		SectionPubKey: t.chainTo[0].Keys.SectionPubKey,
+		Seqno:         atomic.AddUint32(&t.seqnoForward, 1),
+		Payload:       payload,
+	}); err != nil {
 		return -1, fmt.Errorf("send encrypted message error: %w", err)
 	}
 	atomic.AddUint64(&t.packetsSent, 1)
@@ -1212,7 +1176,6 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 }
 
 func (t *RegularOutTunnel) Close() error {
-	// TODO: add callback onClose, to add option to reopen new channel
 	t.close()
 	return nil
 }

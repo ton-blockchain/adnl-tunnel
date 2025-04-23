@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"github.com/kevinms/leakybucket-go"
+	"github.com/rs/zerolog/log"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/tonutils-go/adnl"
@@ -516,6 +517,7 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 	amt := new(big.Int).Sub(st.Amount.Nano(), lastAmt)
 	if amt.Sign() <= 0 {
 		// already processed payment
+		log.Trace().Str("key", base64.StdEncoding.EncodeToString(ins.Key)).Msg("already processed payment")
 		return nil
 	}
 
@@ -555,7 +557,7 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			x := addPrepaid(&out.PrepaidPacketsOut, num)
 			z := addPrepaid(&out.PrepaidPacketsIn, num)
 			out.mx.RUnlock()
-			s.log.Debug().Int64("num", num.Int64()).
+			s.log.Info().Int64("num", num.Int64()).
 				Int64("out_balance", x).
 				Int64("in_balance", z).
 				Str("payment", st.Amount.String()).
@@ -590,7 +592,7 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		mutation = func() {
 			route.PaymentReceived = true
 			x := addPrepaid(&route.PrepaidPackets, num)
-			s.log.Debug().Uint32("route", routeId).
+			s.log.Info().Uint32("route", routeId).
 				Int64("num", num.Int64()).
 				Int64("balance", x).
 				Str("payment", st.Amount.String()).
@@ -944,7 +946,7 @@ func (o *Out) Listen(g *Gateway, threads int) {
 				if o.PricePerPacket.Sign() > 0 {
 					maxCredit := (atomic.LoadUint64(&o.PacketsSentIn)/100)*LossAcceptablePercent + LossAcceptableStartup
 					if prepaid := atomic.LoadInt64(&o.PrepaidPacketsIn); prepaid <= -int64(maxCredit) {
-						o.log.Debug().Int64("credit", prepaid).Uint64("sent", atomic.LoadUint64(&o.PacketsSentIn)).Msg("incoming packet was dropped because not paid")
+						o.log.Trace().Int64("credit", prepaid).Uint64("sent", atomic.LoadUint64(&o.PacketsSentIn)).Msg("incoming packet was dropped because not paid")
 						continue
 					}
 					// we not so care about concurrency here, and it is okay to allow couple packets overdraft
