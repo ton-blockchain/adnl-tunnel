@@ -331,7 +331,7 @@ func (t *RegularOutTunnel) startControlSender() {
 
 		msg, _, err := t.prepareTunnelControlMessage(attachPayments, atomic.LoadInt32(&t.paymentsConfirmed) == 0)
 		if err != nil {
-			t.log.Error().Err(err).Msg("prepare tunnel pings failed")
+			t.log.Error().Err(err).Msg("prepare control message failed")
 			continue
 		}
 
@@ -650,8 +650,6 @@ func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePaymen
 
 	msg := &EncryptedMessage{}
 
-	debtMoved := false
-
 	var mutations []func()
 
 	for i := len(nodes) - 1; i >= 0; i-- {
@@ -727,7 +725,6 @@ func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePaymen
 
 					if debt := prepay - payFor; debt > 0 {
 						// we cannot pay for this in single payment channel, amount is too big, will open new one with next payment and pay diff
-						debtMoved = true
 						t.log.Debug().Int64("packets_num", debt).Str("section_key", base64.StdEncoding.EncodeToString(nodes[i].Keys.SectionPubKey)).Msg("part of the debt moved to pay later, channel is too small")
 					}
 
@@ -795,7 +792,7 @@ func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePaymen
 	}
 
 	if len(mutations) == 0 {
-		t.log.Debug().Msg("payments not needed")
+		t.log.Debug().Msg("new payments not needed")
 	}
 
 	t.controlSeqno++
@@ -845,10 +842,6 @@ func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePaymen
 	atomic.StoreInt64(&t.packetsMinPaidOut, minPaidOut)
 
 	t.log.Debug().Uint64("seqno", t.controlSeqno).Msg("control instructions prepared")
-
-	if debtMoved {
-		t.requestControlMessage()
-	}
 
 	return msg, minDeadline, nil
 }
@@ -986,23 +979,20 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 				return fmt.Errorf("invalid port %d", p.Port)
 			}
 
-			atomic.AddUint64(&t.packetsRecv, 1)
+			atomic.AddUint64(&t.packetsRecv, 1) // fact received
+
 			var seqnoDiff uint64
-			for {
-				if prev := atomic.LoadUint64(&t.seqnoRecv); prev < p.Seqno {
-					if !atomic.CompareAndSwapUint64(&t.seqnoRecv, prev, p.Seqno) {
-						continue
-					}
-					seqnoDiff = p.Seqno - prev
-				}
-				break
+			if prev := atomic.LoadUint64(&t.seqnoRecv); prev < p.Seqno &&
+				atomic.CompareAndSwapUint64(&t.seqnoRecv, prev, p.Seqno) {
+				seqnoDiff = p.Seqno - prev
 			}
 
 			if t.usePayments && seqnoDiff > 0 {
 				atomic.AddUint64(&t.packetsRecvPaidConsumed, seqnoDiff)
 
 				paid := atomic.LoadInt64(&t.packetsMinPaidIn)
-				if paid-atomic.AddInt64(&t.packetsConsumedIn, int64(seqnoDiff)) < t.packetsToPrepay/2 {
+				consumed := atomic.AddInt64(&t.packetsConsumedIn, int64(seqnoDiff)) // ideally received (when no loss)
+				if paid-consumed < t.packetsToPrepay/2 {
 					t.requestControlMessage()
 				}
 			}
@@ -1035,7 +1025,7 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 			}
 
 			t.log.Info().Str("ip", net.IP(p.IP).String()).Uint32("port", p.Port).Msg("out gateway updated")
-			
+
 			return nil
 		default:
 			return fmt.Errorf("incorrect payload type: %T", p)
@@ -1204,6 +1194,9 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 func (t *RegularOutTunnel) Close() error {
 	t.close()
+	if t.peer != nil {
+		t.peer.Dereference()
+	}
 	return nil
 }
 

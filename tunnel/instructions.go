@@ -284,12 +284,10 @@ func (ins BuildRouteInstruction) Execute(ctx context.Context, s *Section, msg *E
 		}
 
 		route = &Route{
-			ID:            ins.RouteID,
-			Target:        unsafe.Pointer(target),
-			PacketsRouted: 0,
+			ID:     ins.RouteID,
+			Target: unsafe.Pointer(target),
 			// we need some free capacity to configure route, and not create payment channels for not working tunnels
-			PrepaidPackets: 0,
-			rate:           leakybucket.NewLeakyBucket(FreePacketsMaxPS, FreePacketsMaxPSBurst),
+			rate: leakybucket.NewLeakyBucket(FreePacketsMaxPS, FreePacketsMaxPSBurst),
 		}
 		target.Peer.AddReference()
 		s.routes[ins.RouteID] = route
