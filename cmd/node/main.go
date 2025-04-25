@@ -14,7 +14,6 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/ton-blockchain/adnl-tunnel/config"
 	"github.com/ton-blockchain/adnl-tunnel/tunnel"
-	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
@@ -396,7 +395,7 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 	}
 
 	inv := make(chan any)
-	sc := chain.NewScanner(apiClient, payments.PaymentChannelCodeHash, seqno, scanLog)
+	sc := chain.NewScanner(apiClient, seqno, scanLog)
 	if err = sc.StartSmall(inv); err != nil {
 		log.Fatal().Err(err).Msg("failed to start scanner")
 	}

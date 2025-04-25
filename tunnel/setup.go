@@ -393,7 +393,7 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	}
 
 	inv := make(chan any)
-	sc := chain.NewScanner(apiClient, payments.PaymentChannelCodeHash, seqno, logger)
+	sc := chain.NewScanner(apiClient, seqno, logger)
 	if err = sc.StartSmall(inv); err != nil {
 		return nil, fmt.Errorf("failed to start account scanner: %w", err)
 	}
@@ -462,7 +462,7 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 
 			events <- MsgEvent{Msg: "Preparing payment channel for tunnel..."}
 
-			if _, err = preparePayerPaymentChannel(ctx, svc, sec.Payment.Chain[0].NodeKey, jetton, sec.Payment.ExtraCurrencyID, events); err != nil {
+			if _, err = preparePayerPaymentChannel(ctx, apiClient, svc, sec.Payment.Chain[0].NodeKey, jetton, sec.Payment.ExtraCurrencyID, events); err != nil {
 				return nil, fmt.Errorf("failed to prepare payment channel for %s: %w", key, err)
 			}
 		}
@@ -472,7 +472,7 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	return svc, nil
 }
 
-func preparePayerPaymentChannel(ctx context.Context, pmt *tonpayments.Service, ch []byte, jetton *address.Address, ecID uint32, events chan any) ([]byte, error) {
+func preparePayerPaymentChannel(ctx context.Context, api ton.APIClientWrapped, pmt *tonpayments.Service, ch []byte, jetton *address.Address, ecID uint32, events chan any) ([]byte, error) {
 	list, err := pmt.ListChannels(ctx, nil, db.ChannelStateActive)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list channels: %w", err)
@@ -480,8 +480,32 @@ func preparePayerPaymentChannel(ctx context.Context, pmt *tonpayments.Service, c
 
 	for _, channel := range list {
 		if bytes.Equal(channel.TheirOnchain.Key, ch) {
-			// we have specified channel already deployed
-			return channel.TheirOnchain.Key, nil
+			addr := address.MustParseAddr(channel.Address)
+
+			block, err := api.CurrentMasterchainInfo(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get current block: %w", err)
+			}
+
+			acc, err := api.GetAccount(ctx, block, addr)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get account: %w", err)
+			}
+
+			if acc.State == nil || !acc.IsActive {
+				continue
+			}
+
+			on, err := payments.NewPaymentChannelClient(api).ParseAsyncChannel(addr, acc.Code, acc.Data, true)
+			if err != nil {
+				log.Warn().Err(err).Str("address", addr.String()).Msg("failed to parse payment channel")
+				continue
+			}
+
+			// check is channel is really alive, in case we have outdated status in db
+			if on.Status == payments.ChannelStatusOpen {
+				return channel.TheirOnchain.Key, nil
+			}
 		}
 	}
 
