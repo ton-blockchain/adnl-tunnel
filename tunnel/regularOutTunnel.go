@@ -1079,7 +1079,7 @@ func (t *RegularOutTunnel) WaitForInit(ctx context.Context, events func(string))
 
 			if t.usePayments {
 				if events != nil {
-					events("Tunnel configured, waiting payments...")
+					events("Tunnel configured, sending payments...")
 				}
 
 				t.requestControlMessage()
