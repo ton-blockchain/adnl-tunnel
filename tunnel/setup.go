@@ -54,7 +54,7 @@ type MsgEvent struct {
 	Msg string
 }
 
-func RunTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, netCfg *liteclient.GlobalConfig, logger zerolog.Logger, events chan any) {
+func RunTunnel(closerCtx context.Context, cfg *config.ClientConfig, sharedCfg *config.SharedConfig, netCfg *liteclient.GlobalConfig, logger zerolog.Logger, events chan any) {
 	var nodes []config.TunnelRouteSection
 
 	if !cfg.PaymentsEnabled {
@@ -94,26 +94,31 @@ func RunTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, netCfg 
 		events <- fmt.Errorf("failed to bind listener: %w", err)
 		return
 	}
+	defer conn.Close()
 
 	ml := adnl.NewMultiNetReader(conn)
+	defer ml.Close()
 
 	gate := adnl.NewGatewayWithNetManager(tunKey, ml)
 	if err = gate.StartClient(8); err != nil {
 		events <- fmt.Errorf("start gateway as client failed: %w", err)
 		return
 	}
+	defer gate.Close()
 
 	dhtGate := adnl.NewGatewayWithNetManager(dhtKey, ml)
 	if err = dhtGate.StartClient(); err != nil {
 		events <- fmt.Errorf("start dht gateway failed: %w", err)
 		return
 	}
+	defer dhtGate.Close()
 
 	dhtClient, err := dht.NewClientFromConfig(dhtGate, netCfg)
 	if err != nil {
 		events <- fmt.Errorf("failed to create DHT client: %w", err)
 		return
 	}
+	defer dhtClient.Close()
 
 	var pay *tonpayments.Service
 	if cfg.PaymentsEnabled {
@@ -142,6 +147,7 @@ func RunTunnel(cfg *config.ClientConfig, sharedCfg *config.SharedConfig, netCfg 
 			return
 		}
 	}()
+	defer tGate.Stop()
 
 	attempts := map[string]bool{}
 reinit:
@@ -149,7 +155,7 @@ reinit:
 		events <- MsgEvent{Msg: "Configuring tunnel route..."}
 
 		var lastAsk int64
-		ctxInit, cancel := context.WithTimeout(tGate.closerCtx, 60*time.Second)
+		ctxInit, cancel := context.WithTimeout(closerCtx, 60*time.Second)
 		tun, port, ip, err, retryable := configureRoute(ctxInit, cfg, tGate, nodes, attempts, events)
 		cancel()
 		if err != nil {
@@ -172,6 +178,8 @@ reinit:
 		for {
 			select {
 			case <-tGate.closerCtx.Done():
+				return
+			case <-closerCtx.Done():
 				return
 			case <-time.After(5 * time.Second):
 				now := time.Now().Unix()

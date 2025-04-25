@@ -164,7 +164,7 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 	}
 
 	events := make(chan any, 1)
-	go tunnel.RunTunnel(&cfg, &sharedCfg, &netCfg, log.Logger, events)
+	go tunnel.RunTunnel(context.Background(), &cfg, &sharedCfg, &netCfg, log.Logger, events)
 
 	indexMatch = []unsafe.Pointer{nil}
 

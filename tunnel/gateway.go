@@ -268,6 +268,14 @@ func (g *Gateway) GetPacketsStats() map[string]*SectionStats {
 	return res
 }
 
+func (g *Gateway) Stop() error {
+	g.close()
+	if g.payments.Service != nil {
+		g.payments.Service.Stop()
+	}
+	return nil
+}
+
 func (g *Gateway) Start() error {
 	connHandler := func(client adnl.Peer) error {
 		p := g.addPeer(client.GetID(), client)
