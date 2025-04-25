@@ -381,6 +381,7 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	defer onEnd(fdb.Close)
 
 	tr := transport.NewServer(dhtClient, gate, serverPrv, nodePrv, false)
+	defer onEnd(tr.Stop)
 
 	var seqno uint32
 	if bo, err := fdb.GetBlockOffset(ctx); err != nil {
