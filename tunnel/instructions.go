@@ -749,7 +749,7 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		IP:    gateAddresses[0].IP,
 		Port:  uint32(port),
 	}, false); err != nil {
-		s.log.Warn().Err(err).Msg("send back failed")
+		s.log.Debug().Err(err).Msg("send back failed")
 	}
 
 	return nil
@@ -962,7 +962,7 @@ func (o *Out) Listen(g *Gateway, threads int) {
 				g.bufPool.Put(p.buf)
 
 				if err != nil {
-					o.log.Warn().Err(err).Msg("send back failed")
+					o.log.Debug().Err(err).Msg("send back failed")
 					continue
 				}
 			}

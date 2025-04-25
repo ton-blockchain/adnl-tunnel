@@ -315,7 +315,7 @@ func (t *RegularOutTunnel) startControlSender() {
 				paidUsed := atomic.LoadUint64(&t.packetsRecvPaidConsumed)
 
 				// attaching payments only after checking that tunnel works
-				attachPayments = t.controlSeqno > 0 && t.controlSeqno == t.controlSeqnoReceived
+				attachPayments = t.controlSeqnoReceived > 0
 				if attachPayments {
 					const LossNumAcceptable = 5000 // + 33%
 					if paidUsed > received+received/3+LossNumAcceptable {
@@ -690,17 +690,21 @@ func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePaymen
 			}
 
 			if !skipNewPayment {
-				prepay := consumedOut
+				balance := consumedOut
 				if i >= len(t.chainTo) {
-					prepay = consumedIn
+					balance = consumedIn
 				} else if i == len(t.chainTo)-1 {
 					// out gate
-					prepay = consumedMax
+					balance = consumedMax
 				}
-				prepay -= p.PaidPackets
-				prepay += t.packetsToPrepay
+				balance = p.PaidPackets - balance
 
-				if prepay > t.packetsToPrepay/2 || forcePayments {
+				if balance <= t.packetsToPrepay/2 || forcePayments {
+					prepay := t.packetsToPrepay - balance
+					if prepay < 0 {
+						prepay = 0
+					}
+
 					price := new(big.Int).SetUint64(p.PricePerPacket)
 					if p.CurrentChannel == nil || p.CurrentChannel.SafeDeadline.Before(time.Now()) {
 						regularAmount := new(big.Int).Mul(big.NewInt(t.packetsToPrepay), price)
