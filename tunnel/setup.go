@@ -327,6 +327,7 @@ reassemble:
 		events <- MsgEvent{Msg: s}
 	})
 	if err != nil {
+		_ = tun.Close()
 		return nil, 0, nil, fmt.Errorf("wait for tunnel init failed: %w", err), true
 	}
 
