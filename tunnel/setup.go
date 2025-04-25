@@ -54,8 +54,11 @@ type MsgEvent struct {
 	Msg string
 }
 
-func RunTunnel(closerCtx context.Context, cfg *config.ClientConfig, sharedCfg *config.SharedConfig, netCfg *liteclient.GlobalConfig, logger zerolog.Logger, events chan any) {
+func RunTunnel(stopCtx context.Context, cfg *config.ClientConfig, sharedCfg *config.SharedConfig, netCfg *liteclient.GlobalConfig, logger zerolog.Logger, events chan any) {
 	var nodes []config.TunnelRouteSection
+
+	closerCtx, cancel := context.WithCancel(stopCtx)
+	defer cancel()
 
 	if !cfg.PaymentsEnabled {
 		for i, section := range sharedCfg.NodesPool {
@@ -123,7 +126,7 @@ func RunTunnel(closerCtx context.Context, cfg *config.ClientConfig, sharedCfg *c
 	var pay *tonpayments.Service
 	if cfg.PaymentsEnabled {
 		lsClient := liteclient.NewConnectionPool()
-		if err := lsClient.AddConnectionsFromConfig(context.Background(), netCfg); err != nil {
+		if err := lsClient.AddConnectionsFromConfig(closerCtx, netCfg); err != nil {
 			events <- fmt.Errorf("failed to connect to liteservers: %w", err)
 			return
 		}
@@ -131,7 +134,7 @@ func RunTunnel(closerCtx context.Context, cfg *config.ClientConfig, sharedCfg *c
 		apiClient := ton.NewAPIClient(lsClient, ton.ProofCheckPolicyFast).WithRetry().WithTimeout(10 * time.Second)
 
 		events <- MsgEvent{Msg: "Preparing tunnel payments..."}
-		pay, err = preparePayerPayments(context.Background(), apiClient, dhtClient, cfg, sharedCfg, logger, ml, events)
+		pay, err = preparePayerPayments(closerCtx, apiClient, dhtClient, cfg, sharedCfg, logger, ml, events)
 		if err != nil {
 			events <- fmt.Errorf("prepare payments failed: %w", err)
 			return
@@ -341,15 +344,41 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	serverPrv := ed25519.NewKeyFromSeed(cfg.Payments.ADNLServerKey)
 	gate := adnl.NewGatewayWithNetManager(serverPrv, manager)
 
+	var onCloseExec []func()
+	initOk := false
+	onEnd := func(f func()) {
+		if !initOk {
+			f()
+			return
+		}
+		onCloseExec = append(onCloseExec, f)
+	}
+
+	// we need this to gracefully close backgrounds on error or after exec when ctx is done (on service stop)
+	defer func() {
+		if initOk {
+			go func() {
+				<-ctx.Done()
+				for _, f := range onCloseExec {
+					f()
+				}
+			}()
+		}
+	}()
+
 	if err := gate.StartClient(); err != nil {
 		return nil, fmt.Errorf("failed to init adnl gateway: %w", err)
 	}
+	defer onEnd(func() {
+		_ = gate.Close()
+	})
 
 	walletPrv := ed25519.NewKeyFromSeed(cfg.Payments.WalletPrivateKey)
 	fdb, err := leveldb.NewDB(cfg.Payments.DBPath, nodePrv.Public().(ed25519.PublicKey))
 	if err != nil {
 		return nil, fmt.Errorf("failed to init leveldb: %w", err)
 	}
+	defer onEnd(fdb.Close)
 
 	tr := transport.NewServer(dhtClient, gate, serverPrv, nodePrv, false)
 
@@ -367,16 +396,17 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	if err = sc.StartSmall(inv); err != nil {
 		return nil, fmt.Errorf("failed to start account scanner: %w", err)
 	}
+	defer onEnd(sc.Stop)
 	fdb.SetOnChannelUpdated(sc.OnChannelUpdate)
 
-	chList, err := fdb.GetChannels(context.Background(), nil, db.ChannelStateAny)
+	chList, err := fdb.GetChannels(ctx, nil, db.ChannelStateAny)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load channels: %w", err)
 	}
 
 	for _, channel := range chList {
 		if channel.Status != db.ChannelStateInactive {
-			sc.OnChannelUpdate(context.Background(), channel, true)
+			sc.OnChannelUpdate(ctx, channel, true)
 		}
 	}
 
@@ -402,6 +432,7 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	logger.Info().Msg("payment node initialized with public key: " + base64.StdEncoding.EncodeToString(nodePrv.Public().(ed25519.PublicKey)))
 
 	go svc.Start()
+	defer onEnd(svc.Stop)
 
 	var requiredChannels = map[string]bool{}
 	for _, sec := range sharedCfg.NodesPool {
@@ -436,6 +467,7 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 		}
 	}
 
+	initOk = true
 	return svc, nil
 }
 
@@ -454,7 +486,7 @@ func preparePayerPaymentChannel(ctx context.Context, pmt *tonpayments.Service, c
 
 	events <- MsgEvent{Msg: "Deploying payment channel for tunnel..."}
 
-	ctxTm, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	ctxTm, cancel := context.WithTimeout(ctx, 150*time.Second)
 	addr, err := pmt.DeployChannelWithNode(ctxTm, ch, jetton, ecID)
 	cancel()
 	if err != nil {
@@ -463,7 +495,7 @@ func preparePayerPaymentChannel(ctx context.Context, pmt *tonpayments.Service, c
 	log.Info().Msg("Onchain channel deployed at address: " + addr.String() + " waiting for states exchange...")
 
 	for {
-		channel, err := pmt.GetChannel(context.Background(), addr.String())
+		channel, err := pmt.GetChannel(ctx, addr.String())
 		if err != nil {
 			if errors.Is(err, db.ErrNotFound) {
 				time.Sleep(500 * time.Millisecond)
