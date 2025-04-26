@@ -1014,6 +1014,11 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 			t.mx.Lock()
 			defer t.mx.Unlock()
 
+			if atomic.LoadUint64(&t.seqnoRecv) > p.Seqno {
+				// out gateway restarted, reset seqno to be in sync
+				atomic.StoreUint64(&t.seqnoRecv, p.Seqno)
+			}
+
 			if t.externalAddr.Equal(p.IP) && t.externalPort == uint16(p.Port) {
 				return nil
 			}
