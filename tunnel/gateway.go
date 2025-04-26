@@ -123,7 +123,7 @@ type Section struct {
 	out          *Out
 
 	cachedActions    []CachedAction
-	cachedActionsVer uint32
+	cachedActionsVer uint64
 
 	payments map[string]*PaymentChannel
 

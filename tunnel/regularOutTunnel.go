@@ -213,7 +213,7 @@ func buildRoute(initial bool, msg *EncryptedMessage, cur, next *SectionInfo, pre
 			RouteID:             routeId,
 			PricePerPacket:      price,
 		}, CacheInstruction{
-			Version: uint32(time.Now().Unix()),
+			Version: uint64(time.Now().UnixNano()),
 			Instructions: []any{
 				RouteInstruction{
 					RouteID: routeId,
@@ -869,7 +869,7 @@ func (t *RegularOutTunnel) prepareInitMessage(state uint32) (*EncryptedMessage, 
 						}
 
 						if err := t.chainFrom[y].Keys.EncryptInstructionsMessage(backMsg, ins, CacheInstruction{
-							Version:      uint32(time.Now().Unix()),
+							Version:      uint64(time.Now().UnixNano()),
 							Instructions: []any{ins},
 						}); err != nil {
 							return nil, fmt.Errorf("encrypt layer %d failed: %w", i, err)
@@ -905,7 +905,7 @@ func (t *RegularOutTunnel) prepareInitMessage(state uint32) (*EncryptedMessage, 
 					ReceiverPubKey:       t.payloadKeys.SectionPubKey,
 					PricePerPacket:       price,
 				}, CacheInstruction{
-					Version:      uint32(time.Now().Unix()),
+					Version:      uint64(time.Now().UnixNano()),
 					Instructions: []any{SendOutInstruction{}},
 				}); err != nil {
 					return nil, fmt.Errorf("encrypt bind out failed: %w", err)
@@ -914,7 +914,7 @@ func (t *RegularOutTunnel) prepareInitMessage(state uint32) (*EncryptedMessage, 
 			}
 
 			if err := t.chainTo[i].Keys.EncryptInstructionsMessage(msg, CacheInstruction{
-				Version:      uint32(time.Now().Unix()),
+				Version:      uint64(time.Now().UnixNano()),
 				Instructions: []any{SendOutInstruction{}},
 			}); err != nil {
 				return nil, fmt.Errorf("encrypt send out failed: %w", err)

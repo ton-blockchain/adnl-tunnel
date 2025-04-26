@@ -41,7 +41,7 @@ func init() {
 	tl.Register(DeliverPayload{}, "adnlTunnel.deliverPayload seqno:long payload:bytes = adnlTunnel.DeliverPayload")
 	tl.Register(OutBindDonePayload{}, "adnlTunnel.outBindDonePayload seqno:long ip:bytes port:int = adnlTunnel.OutBindDonePayload")
 
-	instructionOpcodes[tl.Register(CacheInstruction{}, "adnlTunnel.cacheInstruction version:int instructions:(vector adnlTunnel.Instruction) = adnlTunnel.Instruction")] = reflect.TypeOf(CacheInstruction{})
+	instructionOpcodes[tl.Register(CacheInstruction{}, "adnlTunnel.cacheInstruction version:long instructions:(vector adnlTunnel.Instruction) = adnlTunnel.Instruction")] = reflect.TypeOf(CacheInstruction{})
 	instructionOpcodes[tl.Register(RouteInstruction{}, "adnlTunnel.routeInstruction routeId:int nextChecksum:long = adnlTunnel.Instruction")] = reflect.TypeOf(RouteInstruction{})
 	instructionOpcodes[tl.Register(BuildRouteInstruction{}, "adnlTunnel.buildRouteInstruction targetADNL:int256 targetSectionPubKey:int256 routeId:int = adnlTunnel.Instruction")] = reflect.TypeOf(BuildRouteInstruction{})
 	instructionOpcodes[tl.Register(PaymentInstruction{}, "adnlTunnel.paymentInstruction paymentChannelState:bytes = adnlTunnel.Instruction")] = reflect.TypeOf(PaymentInstruction{})
@@ -129,22 +129,20 @@ func (c InstructionsContainer) Serialize(buf *bytes.Buffer) error {
 
 // CacheInstruction save instruction to cache, to reduce next packets size
 type CacheInstruction struct {
-	Version          uint32
-	PayloadVerifyKey uint64
-	Instructions     []any
+	Version      uint64
+	Instructions []any
 }
 
 // Parse implemented manually for optimization
 func (ins *CacheInstruction) Parse(data []byte) ([]byte, error) {
-	if len(data) < 16 {
+	if len(data) < 12 {
 		return nil, fmt.Errorf("corrupted instruction, len %d", len(data))
 	}
 
-	ins.Version = binary.LittleEndian.Uint32(data)
-	ins.PayloadVerifyKey = binary.LittleEndian.Uint64(data[4:])
+	ins.Version = binary.LittleEndian.Uint64(data)
 
-	num := int(binary.LittleEndian.Uint32(data[12:]))
-	data = data[16:]
+	num := int(binary.LittleEndian.Uint32(data[8:]))
+	data = data[12:]
 
 	for i := 0; i < num; i++ {
 		if len(data) < 4 {
@@ -172,10 +170,9 @@ func (ins *CacheInstruction) Parse(data []byte) ([]byte, error) {
 
 // Serialize implemented manually for optimization
 func (ins CacheInstruction) Serialize(buf *bytes.Buffer) error {
-	tmp := make([]byte, 16)
-	binary.LittleEndian.PutUint32(tmp, ins.Version)
-	binary.LittleEndian.PutUint64(tmp[4:], ins.PayloadVerifyKey)
-	binary.LittleEndian.PutUint32(tmp[12:], uint32(len(ins.Instructions)))
+	tmp := make([]byte, 12)
+	binary.LittleEndian.PutUint64(tmp, ins.Version)
+	binary.LittleEndian.PutUint32(tmp[8:], uint32(len(ins.Instructions)))
 	buf.Write(tmp)
 
 	for i, s := range ins.Instructions {
@@ -240,6 +237,12 @@ func (ins CacheInstruction) Execute(ctx context.Context, s *Section, msg *Encryp
 	if s.cachedActionsVer < ins.Version {
 		s.cachedActions = list
 		s.cachedActionsVer = ins.Version
+
+		// reset seqno on cache update
+		s.seqnoCached.mx.Lock()
+		s.seqnoCached.latest = 0
+		s.seqnoCached.window = [8]uint64{}
+		s.seqnoCached.mx.Unlock()
 	}
 	s.mx.Unlock()
 
