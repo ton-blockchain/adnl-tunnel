@@ -331,7 +331,7 @@ func (g *Gateway) Start() error {
 
 	go g.keepAlivePeersAndSections()
 	<-g.closerCtx.Done()
-	return fmt.Errorf("stopped")
+	return nil
 }
 
 func (g *Gateway) keepAlivePeersAndSections() {
