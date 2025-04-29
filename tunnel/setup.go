@@ -524,7 +524,7 @@ func preparePayerPaymentChannel(ctx context.Context, api ton.APIClientWrapped, p
 	if err != nil {
 		return nil, fmt.Errorf("failed to deploy channel with node: %w", err)
 	}
-	log.Info().Msg("Onchain channel deployed at address: " + addr.String() + " waiting for states exchange...")
+	log.Info().Msg("onchain channel deployed at address: " + addr.String() + " waiting for states exchange...")
 
 	for {
 		channel, err := pmt.GetChannel(ctx, addr.String())
