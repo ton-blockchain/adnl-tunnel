@@ -268,12 +268,16 @@ func (g *Gateway) GetPacketsStats() map[string]*SectionStats {
 	return res
 }
 
-func (g *Gateway) Stop() error {
+func (g *Gateway) Stop(ctx context.Context) error {
+	var err error
 	g.close()
 	if g.payments.Service != nil {
+		if err = g.payments.Service.CommitAllOurVirtualChannelsAndWait(ctx); err != nil {
+			err = fmt.Errorf("commit virtual channels error: %w", err)
+		}
 		g.payments.Service.Stop()
 	}
-	return nil
+	return err
 }
 
 func (g *Gateway) Start() error {

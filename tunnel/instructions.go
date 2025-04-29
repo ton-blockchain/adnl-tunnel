@@ -41,6 +41,7 @@ func init() {
 	tl.Register(DeliverPayload{}, "adnlTunnel.deliverPayload seqno:long payload:bytes = adnlTunnel.DeliverPayload")
 	tl.Register(OutBindDonePayload{}, "adnlTunnel.outBindDonePayload seqno:long ip:bytes port:int = adnlTunnel.OutBindDonePayload")
 
+	instructionOpcodes[tl.Register(DestroyInstruction{}, "adnlTunnel.destroyInstruction = adnlTunnel.Instruction")] = reflect.TypeOf(DestroyInstruction{})
 	instructionOpcodes[tl.Register(CacheInstruction{}, "adnlTunnel.cacheInstruction version:long instructions:(vector adnlTunnel.Instruction) = adnlTunnel.Instruction")] = reflect.TypeOf(CacheInstruction{})
 	instructionOpcodes[tl.Register(RouteInstruction{}, "adnlTunnel.routeInstruction routeId:int nextChecksum:long = adnlTunnel.Instruction")] = reflect.TypeOf(RouteInstruction{})
 	instructionOpcodes[tl.Register(BuildRouteInstruction{}, "adnlTunnel.buildRouteInstruction targetADNL:int256 targetSectionPubKey:int256 routeId:int = adnlTunnel.Instruction")] = reflect.TypeOf(BuildRouteInstruction{})
@@ -124,6 +125,18 @@ func (c InstructionsContainer) Serialize(buf *bytes.Buffer) error {
 		}
 	}
 
+	return nil
+}
+
+// DestroyInstruction tunnel closure
+type DestroyInstruction struct{}
+
+func (ins DestroyInstruction) Execute(ctx context.Context, s *Section, msg *EncryptedMessage, restInstructions []byte) error {
+	if s.closeIfNotLocked() {
+		s.gw.mx.Lock()
+		delete(s.gw.inboundSections, string(s.key))
+		s.gw.mx.Unlock()
+	}
 	return nil
 }
 
@@ -433,7 +446,7 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		return fmt.Errorf("incorrect state cell: %w", err)
 	}
 
-	if st.Amount.Nano().Sign() <= 0 {
+	if st.Amount.Sign() <= 0 {
 		return fmt.Errorf("amount should be positive")
 	}
 
@@ -510,12 +523,12 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 
 	var lastAmt *big.Int
 	if v.LatestState != nil && !justLoadedAndCountable { // we count first after restart even if it was paid before
-		lastAmt = v.LatestState.Amount.Nano()
+		lastAmt = v.LatestState.Amount
 	} else {
 		lastAmt = big.NewInt(0)
 	}
 
-	amt := new(big.Int).Sub(st.Amount.Nano(), lastAmt)
+	amt := new(big.Int).Sub(st.Amount, lastAmt)
 	if amt.Sign() <= 0 {
 		// already processed payment
 		log.Trace().Str("key", base64.StdEncoding.EncodeToString(ins.Key)).Msg("already processed payment")
@@ -965,7 +978,7 @@ func (o *Out) Listen(g *Gateway, threads int) {
 				g.bufPool.Put(p.buf)
 
 				if err != nil {
-					o.log.Debug().Err(err).Msg("send back failed")
+					o.log.Trace().Err(err).Msg("send back failed")
 					continue
 				}
 			}

@@ -54,7 +54,13 @@ type MsgEvent struct {
 	Msg string
 }
 
+type StoppedEvent struct{}
+
 func RunTunnel(stopCtx context.Context, cfg *config.ClientConfig, sharedCfg *config.SharedConfig, netCfg *liteclient.GlobalConfig, logger zerolog.Logger, events chan any) {
+	defer func() {
+		events <- StoppedEvent{}
+	}()
+	
 	var nodes []config.TunnelRouteSection
 
 	closerCtx, cancel := context.WithCancel(stopCtx)
@@ -131,7 +137,7 @@ func RunTunnel(stopCtx context.Context, cfg *config.ClientConfig, sharedCfg *con
 			return
 		}
 
-		apiClient := ton.NewAPIClient(lsClient, ton.ProofCheckPolicyFast).WithRetry().WithTimeout(10 * time.Second)
+		apiClient := ton.NewAPIClient(lsClient, ton.ProofCheckPolicyFast).WithRetry(3).WithTimeout(5 * time.Second)
 
 		events <- MsgEvent{Msg: "Preparing tunnel payments..."}
 		pay, err = preparePayerPayments(closerCtx, apiClient, dhtClient, cfg, sharedCfg, logger, ml, events)
@@ -150,7 +156,14 @@ func RunTunnel(stopCtx context.Context, cfg *config.ClientConfig, sharedCfg *con
 			return
 		}
 	}()
-	defer tGate.Stop()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
+		defer cancel()
+
+		if err := tGate.Stop(ctx); err != nil {
+			log.Error().Err(err).Msg("tunnel gateway graceful stop failed")
+		}
+	}()
 
 	attempts := map[string]bool{}
 reinit:
@@ -189,7 +202,7 @@ reinit:
 				if now-tun.lastFullyCheckedAt > 45 && now-lastAsk > 60 {
 					tGate.log.Warn().Msg("tunnel is stalled for too long, asking about rerouting...")
 					if AskReroute() {
-						_ = tun.Close()
+						_ = tun.Stop(closerCtx)
 						continue reinit
 					} else {
 						tGate.log.Warn().Msg("rerouting denied, waiting 60 seconds before next ask")
@@ -330,7 +343,7 @@ reassemble:
 		events <- MsgEvent{Msg: s}
 	})
 	if err != nil {
-		_ = tun.Close()
+		_ = tun.Stop(ctx)
 		return nil, 0, nil, fmt.Errorf("wait for tunnel init failed: %w", err), true
 	}
 

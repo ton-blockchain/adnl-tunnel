@@ -173,6 +173,9 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 	go func() {
 		for event := range events {
 			switch e := event.(type) {
+			case tunnel.StoppedEvent:
+				log.Info().Msg("tunnel stopped")
+				return
 			case tunnel.UpdatedEvent:
 				log.Info().Msg("tunnel updated")
 

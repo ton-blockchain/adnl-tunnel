@@ -27,6 +27,8 @@ import (
 )
 
 const (
+	StateTypeDestroyed = math.MaxUint32
+
 	StateTypeConfiguring uint32 = iota
 	StateTypeOptimizingRoutes
 	StateTypeOptimized
@@ -75,7 +77,7 @@ type RegularOutTunnel struct {
 	peer              *Peer
 	usePayments       bool
 	paymentsConfirmed int32
-	outConfigured     int32
+	wantDestroy       int32
 
 	tunnelState       uint32
 	sendControlSignal chan struct{}
@@ -265,6 +267,10 @@ func (t *RegularOutTunnel) startControlSender() {
 			return
 		case <-t.sendControlSignal:
 		case <-ticker.C:
+		}
+
+		if atomic.LoadInt32(&t.wantDestroy) != 0 {
+			continue
 		}
 
 		if since := time.Since(lastTry); since < 200*time.Millisecond {
@@ -634,6 +640,45 @@ func (t *RegularOutTunnel) reassembleInstructions(msg *EncryptedMessage) (*Encry
 	return newMsg, nil
 }
 
+func (t *RegularOutTunnel) prepareTunnelCloseMessage() (*EncryptedMessage, error) {
+	t.mx.Lock()
+	defer t.mx.Unlock()
+
+	nodes := append([]*SectionInfo{}, t.chainTo...)
+	nodes = append(nodes, t.chainFrom...)
+
+	msg := &EncryptedMessage{}
+
+	for i := len(nodes) - 1; i >= 0; i-- {
+		if i == len(nodes)-1 {
+			// deliver meta to ourself
+			if err := nodes[i].Keys.EncryptInstructionsMessage(msg, DeliverInitiatorInstruction{
+				From: t.localID,
+				Metadata: StateMeta{
+					State: StateTypeDestroyed,
+				},
+			}); err != nil {
+				return nil, fmt.Errorf("encrypt failed: %w", err)
+			}
+			continue
+		}
+
+		var instructions []tl.Serializable
+
+		routeId := binary.LittleEndian.Uint32(nodes[i+1].Keys.SectionPubKey)
+
+		instructions = append(instructions, RouteInstruction{
+			RouteID: ^routeId, // through system tunnel
+		}, DestroyInstruction{})
+
+		if err := nodes[i].Keys.EncryptInstructionsMessage(msg, instructions...); err != nil {
+			return nil, fmt.Errorf("encrypt failed: %w", err)
+		}
+	}
+
+	return msg, nil
+}
+
 func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePayments bool) (*EncryptedMessage, time.Time, error) {
 	t.mx.Lock()
 	defer t.mx.Unlock()
@@ -735,14 +780,18 @@ func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePaymen
 					amount := new(big.Int).Mul(big.NewInt(payFor), price)
 					stateAmount := new(big.Int).Add(p.CurrentChannel.LastAmount, amount)
 
-					st := &payments.VirtualChannelState{
-						Amount: tlb.FromNanoTON(stateAmount),
+					st := payments.VirtualChannelState{
+						Amount: stateAmount,
 					}
 					st.Sign(p.CurrentChannel.Key)
 
 					pcs, err := tlb.ToCell(st)
 					if err != nil {
 						return nil, time.Time{}, fmt.Errorf("state to cell failed: %w", err)
+					}
+
+					if err = t.gateway.payments.Service.AddVirtualChannelResolve(context.Background(), p.CurrentChannel.Key.Public().(ed25519.PublicKey), st); err != nil {
+						return nil, time.Time{}, fmt.Errorf("add virtual channel resolve failed: %w", err)
 					}
 
 					pi := PaymentInstruction{
@@ -940,6 +989,12 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 		data, err := t.payloadKeys.decryptRecvPayload(payload)
 		if err != nil {
 			return fmt.Errorf("decryptRecvPayload failed: %v", err)
+		}
+
+		if m.State == StateTypeDestroyed && atomic.LoadInt32(&t.wantDestroy) != 0 {
+			t.close()
+			t.log.Info().Msg("tunnel gracefully destroyed")
+			return nil
 		}
 
 		currentState := atomic.LoadUint32(&t.tunnelState)
@@ -1152,7 +1207,11 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 	state := atomic.LoadUint32(&t.tunnelState)
 	if state < StateTypeOptimized {
-		return -1, fmt.Errorf("tunnel is not yet ready for sending")
+		return -1, fmt.Errorf("tunnel is not ready for sending")
+	}
+
+	if atomic.LoadInt32(&t.wantDestroy) != 0 {
+		return -1, fmt.Errorf("tunnel is destroyed")
 	}
 
 	if t.usePayments {
@@ -1202,10 +1261,43 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 }
 
 func (t *RegularOutTunnel) Close() error {
-	t.close()
-	if t.peer != nil {
-		t.peer.Dereference()
+	return t.Stop(t.closerCtx)
+}
+
+func (t *RegularOutTunnel) Stop(ctx context.Context) error {
+	atomic.StoreInt32(&t.wantDestroy, 1)
+
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Second*15)
+		defer cancel()
 	}
+
+	if atomic.LoadUint32(&t.tunnelState) > StateTypeConfiguring {
+		for {
+			msg, err := t.prepareTunnelCloseMessage()
+			if err != nil {
+				t.log.Warn().Err(err).Msg("prepare tunnel close message failed")
+				break
+			}
+
+			if err = t.peer.SendCustomMessage(ctx, msg); err != nil {
+				t.log.Warn().Err(err).Msg("send tunnel close message failed")
+				break
+			}
+
+			select {
+			case <-t.closerCtx.Done():
+			case <-ctx.Done():
+			case <-time.After(500 * time.Millisecond):
+				continue
+			}
+			break
+		}
+	}
+
+	t.close()
+	t.peer.Dereference()
 	return nil
 }
 
