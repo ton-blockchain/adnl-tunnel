@@ -337,7 +337,7 @@ func (t *RegularOutTunnel) startControlSender() {
 
 		msg, _, err := t.prepareTunnelControlMessage(attachPayments, atomic.LoadInt32(&t.paymentsConfirmed) == 0)
 		if err != nil {
-			t.log.Error().Err(err).Msg("prepare control message failed")
+			t.log.Debug().Err(err).Msg("prepare control message failed")
 			continue
 		}
 
