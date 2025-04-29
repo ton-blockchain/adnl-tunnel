@@ -432,7 +432,7 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 		return nil
 	}
 	tr.SetService(svc)
-	log.Info().Str("pubkey", base64.StdEncoding.EncodeToString(nodePrv.Public().(ed25519.PublicKey))).Msg("node initialized")
+	log.Info().Str("pubkey", base64.StdEncoding.EncodeToString(nodePrv.Public().(ed25519.PublicKey))).Msg("payment node initialized")
 
 	return svc
 }

@@ -60,7 +60,7 @@ func RunTunnel(stopCtx context.Context, cfg *config.ClientConfig, sharedCfg *con
 	defer func() {
 		events <- StoppedEvent{}
 	}()
-	
+
 	var nodes []config.TunnelRouteSection
 
 	closerCtx, cancel := context.WithCancel(stopCtx)
@@ -140,11 +140,17 @@ func RunTunnel(stopCtx context.Context, cfg *config.ClientConfig, sharedCfg *con
 		apiClient := ton.NewAPIClient(lsClient, ton.ProofCheckPolicyFast).WithRetry(3).WithTimeout(5 * time.Second)
 
 		events <- MsgEvent{Msg: "Preparing tunnel payments..."}
-		pay, err = preparePayerPayments(closerCtx, apiClient, dhtClient, cfg, sharedCfg, logger, ml, events)
+		var onCloseExec []func()
+		pay, onCloseExec, err = preparePayerPayments(closerCtx, apiClient, dhtClient, cfg, sharedCfg, logger, ml, events)
 		if err != nil {
 			events <- fmt.Errorf("prepare payments failed: %w", err)
 			return
 		}
+		defer func() {
+			for _, f := range onCloseExec {
+				f()
+			}
+		}()
 	}
 
 	tGate := NewGateway(gate, dhtClient, tunKey, logger.With().Str("component", "gateway").Logger(), PaymentConfig{
@@ -352,35 +358,23 @@ reassemble:
 	return tun, extPort, extIP, nil, true
 }
 
-func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, dhtClient *dht.Client, cfg *config.ClientConfig, sharedCfg *config.SharedConfig, logger zerolog.Logger, manager adnl.NetManager, events chan any) (*tonpayments.Service, error) {
+func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, dhtClient *dht.Client, cfg *config.ClientConfig, sharedCfg *config.SharedConfig, logger zerolog.Logger, manager adnl.NetManager, events chan any) (svc *tonpayments.Service, onCloseExec []func(), err error) {
 	nodePrv := ed25519.NewKeyFromSeed(cfg.Payments.PaymentsNodeKey)
 	serverPrv := ed25519.NewKeyFromSeed(cfg.Payments.ADNLServerKey)
 	gate := adnl.NewGatewayWithNetManager(serverPrv, manager)
 
-	var onCloseExec []func()
 	initOk := false
 	onEnd := func(f func()) {
 		if !initOk {
 			f()
 			return
 		}
-		onCloseExec = append(onCloseExec, f)
+		// we need this to gracefully close backgrounds on error or after exec when ctx is done (on service stop)
+		onCloseExec = append([]func(){f}, onCloseExec...)
 	}
 
-	// we need this to gracefully close backgrounds on error or after exec when ctx is done (on service stop)
-	defer func() {
-		if initOk {
-			go func() {
-				<-ctx.Done()
-				for _, f := range onCloseExec {
-					f()
-				}
-			}()
-		}
-	}()
-
 	if err := gate.StartClient(); err != nil {
-		return nil, fmt.Errorf("failed to init adnl gateway: %w", err)
+		return nil, nil, fmt.Errorf("failed to init adnl gateway: %w", err)
 	}
 	defer onEnd(func() {
 		_ = gate.Close()
@@ -389,7 +383,7 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	walletPrv := ed25519.NewKeyFromSeed(cfg.Payments.WalletPrivateKey)
 	fdb, err := leveldb.NewDB(cfg.Payments.DBPath, nodePrv.Public().(ed25519.PublicKey))
 	if err != nil {
-		return nil, fmt.Errorf("failed to init leveldb: %w", err)
+		return nil, nil, fmt.Errorf("failed to init leveldb: %w", err)
 	}
 	defer onEnd(fdb.Close)
 
@@ -399,7 +393,7 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	var seqno uint32
 	if bo, err := fdb.GetBlockOffset(ctx); err != nil {
 		if !errors.Is(err, db.ErrNotFound) {
-			return nil, fmt.Errorf("failed to load block offset: %w", err)
+			return nil, nil, fmt.Errorf("failed to load block offset: %w", err)
 		}
 	} else {
 		seqno = bo.Seqno
@@ -408,14 +402,14 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	inv := make(chan any)
 	sc := chain.NewScanner(apiClient, seqno, logger)
 	if err = sc.StartSmall(inv); err != nil {
-		return nil, fmt.Errorf("failed to start account scanner: %w", err)
+		return nil, nil, fmt.Errorf("failed to start account scanner: %w", err)
 	}
 	defer onEnd(sc.Stop)
 	fdb.SetOnChannelUpdated(sc.OnChannelUpdate)
 
 	chList, err := fdb.GetChannels(ctx, nil, db.ChannelStateAny)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load channels: %w", err)
+		return nil, nil, fmt.Errorf("failed to load channels: %w", err)
 	}
 
 	for _, channel := range chList {
@@ -433,13 +427,13 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to init wallet: %w", err)
+		return nil, nil, fmt.Errorf("failed to init wallet: %w", err)
 	}
 	logger.Info().Msg("wallet initialized with address: " + w.WalletAddress().String())
 
-	svc, err := tonpayments.NewService(apiClient, fdb, tr, w, inv, nodePrv, cfg.Payments.ChannelsConfig)
+	svc, err = tonpayments.NewService(apiClient, fdb, tr, w, inv, nodePrv, cfg.Payments.ChannelsConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to init tonpayments: %w", err)
+		return nil, nil, fmt.Errorf("failed to init tonpayments: %w", err)
 	}
 
 	tr.SetService(svc)
@@ -451,7 +445,7 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	var requiredChannels = map[string]bool{}
 	for _, sec := range sharedCfg.NodesPool {
 		if len(sec.Payment.Chain) == 0 {
-			return nil, fmt.Errorf("no payment nodes chain specified in config for node " + base64.StdEncoding.EncodeToString(sec.Key))
+			return nil, nil, fmt.Errorf("no payment nodes chain specified in config for node " + base64.StdEncoding.EncodeToString(sec.Key))
 		}
 
 		if sec.Payment != nil {
@@ -476,13 +470,13 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 			events <- MsgEvent{Msg: "Preparing payment channel for tunnel..."}
 
 			if _, err = preparePayerPaymentChannel(ctx, apiClient, svc, sec.Payment.Chain[0].NodeKey, jetton, sec.Payment.ExtraCurrencyID, events); err != nil {
-				return nil, fmt.Errorf("failed to prepare payment channel for %s: %w", key, err)
+				return nil, nil, fmt.Errorf("failed to prepare payment channel for %s: %w", key, err)
 			}
 		}
 	}
 
 	initOk = true
-	return svc, nil
+	return
 }
 
 func preparePayerPaymentChannel(ctx context.Context, api ton.APIClientWrapped, pmt *tonpayments.Service, ch []byte, jetton *address.Address, ecID uint32, events chan any) ([]byte, error) {
