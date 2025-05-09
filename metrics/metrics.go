@@ -31,22 +31,22 @@ var (
 		[]string{"paid"},
 	)
 
-	PacketsPerSecond = prometheus.NewCounterVec(
+	PacketsCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name:      "packets_per_second",
+			Name:      "packets_counter",
 			Namespace: "tunnel",
-			Help:      "The number of packets processed per second for each tunnel.",
+			Help:      "The number (thousands) of packets processed per second.",
 		},
-		[]string{"tunnel_id", "type", "paid"}, // tunnel id and type (route/in/out)
+		[]string{"type"}, //  type (route/in/out)
 	)
 
-	PacketsPrepaid = prometheus.NewCounterVec(
+	PacketsPrepaidCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name:      "packets_paid",
+			Name:      "packets_paid_counter",
 			Namespace: "tunnel",
 			Help:      "The number of packets paid, separated by tunnel type.",
 		},
-		[]string{"tunnel_id", "type"},
+		[]string{"type"},
 	)
 )
 
@@ -57,9 +57,9 @@ func RegisterMetrics() {
 		return
 	}
 	Registered = true
-	
-	prometheus.MustRegister(PacketsPerSecond)
-	prometheus.MustRegister(PacketsPrepaid)
+
+	prometheus.MustRegister(PacketsCounter)
+	prometheus.MustRegister(PacketsPrepaidCounter)
 	prometheus.MustRegister(ActiveInboundSections)
 	prometheus.MustRegister(ActiveOutGateways)
 	prometheus.MustRegister(ActiveRoutes)

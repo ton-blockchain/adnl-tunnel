@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/kevinms/leakybucket-go"
 	"github.com/rs/zerolog/log"
+	"github.com/ton-blockchain/adnl-tunnel/metrics"
 	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/tonutils-go/adnl"
@@ -21,6 +22,7 @@ import (
 	"net"
 	"net/netip"
 	"reflect"
+	"strconv"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -307,6 +309,8 @@ func (ins BuildRouteInstruction) Execute(ctx context.Context, s *Section, msg *E
 		}
 		target.Peer.AddReference()
 		s.routes[ins.RouteID] = route
+
+		metrics.ActiveRoutes.WithLabelValues(strconv.FormatBool(target.PricePerPacket > 0)).Inc()
 	} else {
 		existingTarget := (*RouteTarget)(atomic.LoadPointer(&route.Target))
 		adnlChanged := !bytes.Equal(existingTarget.ADNL, target.ADNL)
@@ -319,8 +323,23 @@ func (ins BuildRouteInstruction) Execute(ctx context.Context, s *Section, msg *E
 		}
 
 		if adnlChanged {
-			existingTarget.Peer.Dereference()
 			target.Peer.AddReference()
+			existingTarget.Peer.Dereference()
+		}
+
+		// if changed paid type
+		if (existingTarget.PricePerPacket > 0) != (target.PricePerPacket > 0) {
+			if existingTarget.PricePerPacket > 0 {
+				metrics.ActiveRoutes.WithLabelValues("true").Dec()
+			} else {
+				metrics.ActiveRoutes.WithLabelValues("false").Dec()
+			}
+
+			if target.PricePerPacket > 0 {
+				metrics.ActiveRoutes.WithLabelValues("true").Inc()
+			} else {
+				metrics.ActiveRoutes.WithLabelValues("false").Inc()
+			}
 		}
 
 		atomic.StorePointer(&route.Target, unsafe.Pointer(target))
@@ -341,9 +360,11 @@ type RouteCachedAction struct {
 	Route *Route
 }
 
-func (r *Route) dereferenceTarget() {
+func (r *Route) Close() {
 	target := (*RouteTarget)(atomic.LoadPointer(&r.Target))
 	target.Peer.Dereference()
+
+	metrics.ActiveRoutes.WithLabelValues(strconv.FormatBool(target.PricePerPacket > 0)).Dec()
 }
 
 func (r *Route) Route(ctx context.Context, payload []byte, cached bool, instructions []byte, seqno uint32) error {
@@ -387,6 +408,7 @@ func (r *Route) Route(ctx context.Context, payload []byte, cached bool, instruct
 		return fmt.Errorf("route message failed: %w", err)
 	}
 	atomic.AddUint64(&r.PacketsRouted, 1)
+	atomic.AddUint64(&r.Section.gw.statsRouted, 1)
 
 	return nil
 }
@@ -577,6 +599,8 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 				Str("payment", st.Amount.String()).
 				Int64("payment_ttl_left", timeLeft).
 				Msg("packets prepaid for out gateway")
+
+			metrics.PacketsPrepaidCounter.WithLabelValues("out").Add(float64(num.Int64()))
 		}
 
 	case PaymentPurposeRoute:
@@ -595,7 +619,7 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		}
 
 		if v.LatestState == nil { // first init
-			minCap := new(big.Int).Mul(new(big.Int).SetUint64(target.PricePerPacket), big.NewInt(500))
+			minCap := new(big.Int).Mul(new(big.Int).SetUint64(target.PricePerPacket), big.NewInt(1000))
 
 			if v.Capacity.Cmp(minCap) < 0 {
 				return fmt.Errorf("payment channel capacity is too low")
@@ -612,6 +636,7 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 				Str("payment", st.Amount.String()).
 				Int64("payment_ttl_left", timeLeft).
 				Msg("packets prepaid for route")
+			metrics.PacketsPrepaidCounter.WithLabelValues("route").Add(float64(num.Int64()))
 		}
 	default:
 		return fmt.Errorf("unknown payment purpose: %d", v.Purpose>>32)
@@ -699,6 +724,7 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 
 		closer, cancel := context.WithCancel(context.Background())
 		s.out = &Out{
+			gw:                  s.gw,
 			inboundPeer:         s.gw.addPeer(ins.InboundNodeADNL, nil),
 			conn:                conn,
 			closer:              closer,
@@ -714,8 +740,10 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			log:                 s.log.With().Str("component", "out").Logger(),
 		}
 
+		metrics.ActiveOutGateways.WithLabelValues(strconv.FormatBool(ins.PricePerPacket > 0)).Inc()
+
 		s.out.inboundPeer.AddReference()
-		go s.out.Listen(s.gw, 8)
+		go s.out.Listen(8)
 
 		port = uint16(s.out.conn.LocalAddr().(*net.UDPAddr).Port)
 		s.log.Info().
@@ -888,6 +916,8 @@ func (o *Out) Close() {
 	o.conn.Close()
 	o.inboundPeer.Dereference()
 
+	metrics.ActiveOutGateways.WithLabelValues(strconv.FormatBool(o.PricePerPacket.Sign() > 0)).Dec()
+
 	o.log.Debug().Msg("closing out")
 }
 
@@ -937,6 +967,7 @@ func (o *Out) Send(payload []byte) error {
 		return fmt.Errorf("write out failed: %w", err)
 	}
 	atomic.AddUint64(&o.PacketsSentOut, 1)
+	atomic.AddUint64(&o.gw.statsSent, 1)
 
 	return nil
 }
@@ -944,7 +975,7 @@ func (o *Out) Send(payload []byte) error {
 const LossAcceptablePercent = 0
 const LossAcceptableStartup = 20000
 
-func (o *Out) Listen(g *Gateway, threads int) {
+func (o *Out) Listen(threads int) {
 	pks := make(chan inPacket, 256*1024)
 
 	for i := 0; i < threads; i++ {
@@ -967,6 +998,7 @@ func (o *Out) Listen(g *Gateway, threads int) {
 					// we not so care about concurrency here, and it is okay to allow couple packets overdraft
 					atomic.AddInt64(&o.PrepaidPacketsIn, -1)
 				}
+				atomic.AddUint64(&o.gw.statsReceived, 1)
 
 				src := p.from.(*net.UDPAddr)
 				err := o.sendBack(DeliverUDPPayload{
@@ -975,7 +1007,7 @@ func (o *Out) Listen(g *Gateway, threads int) {
 					Port:    uint32(src.Port),
 					Payload: p.buf[:p.n],
 				}, true)
-				g.bufPool.Put(p.buf)
+				o.gw.bufPool.Put(p.buf)
 
 				if err != nil {
 					o.log.Trace().Err(err).Msg("send back failed")
@@ -986,7 +1018,7 @@ func (o *Out) Listen(g *Gateway, threads int) {
 	}
 
 	for {
-		buf := g.bufPool.Get().([]byte)
+		buf := o.gw.bufPool.Get().([]byte)
 		n, from, err := o.conn.ReadFrom(buf)
 		if err != nil {
 			select {
@@ -1004,7 +1036,7 @@ func (o *Out) Listen(g *Gateway, threads int) {
 		//TODO: verify packets as much as possible
 
 		if n < 64 {
-			g.bufPool.Put(buf)
+			o.gw.bufPool.Put(buf)
 			// too small packet
 			continue
 		}
@@ -1017,7 +1049,7 @@ func (o *Out) Listen(g *Gateway, threads int) {
 		}:
 		default:
 			// overflow
-			g.bufPool.Put(buf)
+			o.gw.bufPool.Put(buf)
 		}
 	}
 }

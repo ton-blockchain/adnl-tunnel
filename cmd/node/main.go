@@ -10,9 +10,11 @@ import (
 	"flag"
 	"fmt"
 	"github.com/natefinch/lumberjack"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/ton-blockchain/adnl-tunnel/config"
+	"github.com/ton-blockchain/adnl-tunnel/metrics"
 	"github.com/ton-blockchain/adnl-tunnel/tunnel"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain"
@@ -47,6 +49,8 @@ var LogFilename = flag.String("log-filename", "tunnel.log", "log file name")
 var LogMaxSize = flag.Int("log-max-size", 1024, "maximum log file size in MB before rotation")
 var LogMaxBackups = flag.Int("log-max-backups", 16, "maximum number of old log files to keep")
 var LogMaxAge = flag.Int("log-max-age", 180, "maximum number of days to retain old log files")
+var ProfileAddr = flag.String("profile-listen-addr", "", "Addr to run the pprof server on (optional, disabled if empty)")
+var MetricsAddr = flag.String("metrics-listen-addr", "", "Addr to run the prometheus metrics server on (optional, disabled if empty)")
 var LogCompress = flag.Bool("log-compress", false, "whether to compress rotated log files")
 var LogDisableFile = flag.Bool("log-disable-file", false, "Disable logging to file")
 
@@ -82,13 +86,25 @@ func main() {
 		}
 	}
 
-	go func() {
-		runtime.SetMutexProfileFraction(1)
-		log.Info().Msg("starting pprof server on :6065")
-		if err := http.ListenAndServe(":6065", nil); err != nil {
-			log.Fatal().Err(err).Msg("error starting pprof server")
-		}
-	}()
+	if *ProfileAddr != "" {
+		go func() {
+			runtime.SetMutexProfileFraction(1)
+			log.Info().Str("addr", *ProfileAddr).Msg("starting pprof server")
+			if err := http.ListenAndServe(*ProfileAddr, nil); err != nil {
+				log.Fatal().Err(err).Msg("error starting pprof server")
+			}
+		}()
+	}
+
+	if *MetricsAddr != "" {
+		metrics.RegisterMetrics()
+		go func() {
+			log.Info().Str("addr", *MetricsAddr).Msg("starting metrics server")
+			if err := http.ListenAndServe(*MetricsAddr, promhttp.Handler()); err != nil {
+				log.Fatal().Err(err).Msg("error starting metrics server")
+			}
+		}()
+	}
 
 	if *Verbosity >= 3 {
 		log.Logger = log.Logger.Level(zerolog.DebugLevel).With().Logger()

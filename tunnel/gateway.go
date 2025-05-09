@@ -63,6 +63,7 @@ type Route struct {
 }
 
 type Out struct {
+	gw          *Gateway
 	inboundPeer *Peer
 	conn        net.PacketConn
 
@@ -152,6 +153,10 @@ type Gateway struct {
 
 	tunnels map[uint32]Tunnel
 
+	statsReceived uint64
+	statsSent     uint64
+	statsRouted   uint64
+
 	payments PaymentConfig
 
 	bufPool sync.Pool
@@ -212,7 +217,7 @@ func NewGateway(gate *adnl.Gateway, dht *dht.Client, key ed25519.PrivateKey, log
 	}
 
 	if metrics.Registered {
-
+		go g.speedMetricsUpdater()
 	}
 	return g
 }
@@ -231,6 +236,31 @@ func (g *Gateway) requestCheckPeers() {
 	select {
 	case g.signalCheckPeers <- struct{}{}:
 	default:
+	}
+}
+
+func (g *Gateway) speedMetricsUpdater() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	var routedPrev, inPrev, outPrev uint64
+	for {
+		select {
+		case <-g.closerCtx.Done():
+			return
+		case <-ticker.C:
+			routed := atomic.LoadUint64(&g.statsRouted) / 1000
+			in := atomic.LoadUint64(&g.statsReceived) / 1000
+			out := atomic.LoadUint64(&g.statsSent) / 1000
+
+			metrics.PacketsCounter.WithLabelValues("routed").Add(float64(routed - routedPrev))
+			metrics.PacketsCounter.WithLabelValues("in").Add(float64(in - inPrev))
+			metrics.PacketsCounter.WithLabelValues("out").Add(float64(out - outPrev))
+
+			routedPrev = routed
+			inPrev = in
+			outPrev = out
+		}
 	}
 }
 
@@ -339,6 +369,7 @@ func (g *Gateway) keepAlivePeersAndSections() {
 	const PeerMaxInactiveSec = 10
 
 	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -495,6 +526,8 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 				g.mx.Lock()
 				g.inboundSections[string(m.SectionPubKey)] = sec
 				g.mx.Unlock()
+
+				metrics.ActiveInboundSections.Inc()
 			}
 
 			container, restInstructions, err := sec.decryptMessage(&m)
@@ -641,7 +674,7 @@ func (s *Section) closeIfNotLocked() bool {
 	}
 
 	for _, r := range s.routes {
-		r.dereferenceTarget()
+		r.Close()
 	}
 
 	if s.out != nil {
@@ -649,6 +682,8 @@ func (s *Section) closeIfNotLocked() bool {
 		s.out.Close()
 	}
 	s.log.Debug().Msg("section closed")
+
+	metrics.ActiveInboundSections.Dec()
 
 	return true
 }
