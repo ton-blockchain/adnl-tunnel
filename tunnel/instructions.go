@@ -302,8 +302,9 @@ func (ins BuildRouteInstruction) Execute(ctx context.Context, s *Section, msg *E
 		}
 
 		route = &Route{
-			ID:     ins.RouteID,
-			Target: unsafe.Pointer(target),
+			ID:      ins.RouteID,
+			Target:  unsafe.Pointer(target),
+			Section: s,
 			// we need some free capacity to configure route, and not create payment channels for not working tunnels
 			rate: leakybucket.NewLeakyBucket(FreePacketsMaxPS, FreePacketsMaxPSBurst),
 		}
