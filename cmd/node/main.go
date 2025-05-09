@@ -387,10 +387,22 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 	}
 
 	walletPrv := ed25519.NewKeyFromSeed(cfg.Payments.WalletPrivateKey)
-	fdb, err := leveldb.NewDB(cfg.Payments.DBPath, nodePrv.Public().(ed25519.PublicKey))
+	fdb, freshDb, err := leveldb.NewDB(cfg.Payments.DBPath, nodePrv.Public().(ed25519.PublicKey))
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to init leveldb")
 		return nil
+	}
+
+	if freshDb {
+		if err = fdb.SetMigrationVersion(context.Background(), len(db.Migrations)); err != nil {
+			log.Fatal().Err(err).Msg("failed to set initial migration version")
+			return nil
+		}
+	} else {
+		if err = db.RunMigrations(fdb); err != nil {
+			log.Fatal().Err(err).Msg("failed to run migrations")
+			return nil
+		}
 	}
 
 	tr := transport.NewServer(dhtClient, gate, serverPrv, nodePrv, cfg.ExternalIP != "")

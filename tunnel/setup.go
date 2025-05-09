@@ -381,11 +381,21 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	})
 
 	walletPrv := ed25519.NewKeyFromSeed(cfg.Payments.WalletPrivateKey)
-	fdb, err := leveldb.NewDB(cfg.Payments.DBPath, nodePrv.Public().(ed25519.PublicKey))
+	fdb, freshDb, err := leveldb.NewDB(cfg.Payments.DBPath, nodePrv.Public().(ed25519.PublicKey))
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to init leveldb: %w", err)
 	}
 	defer onEnd(fdb.Close)
+
+	if freshDb {
+		if err = fdb.SetMigrationVersion(ctx, len(db.Migrations)); err != nil {
+			return nil, nil, fmt.Errorf("failed to set migration version: %w", err)
+		}
+	} else {
+		if err = db.RunMigrations(fdb); err != nil {
+			return nil, nil, fmt.Errorf("failed to run migrations: %w", err)
+		}
+	}
 
 	tr := transport.NewServer(dhtClient, gate, serverPrv, nodePrv, false)
 	defer onEnd(tr.Stop)
