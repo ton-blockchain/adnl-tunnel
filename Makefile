@@ -1,9 +1,12 @@
-.PHONY: all build
+.PHONY: binary library
 
 ver := $(shell git describe --tags --always --dirty)
 
-build:
+binary:
 	go build -ldflags "-w -s -X main.GitCommit=$(ver)" -o build/tunnel-node cmd/node/main.go
+
+library:
+	go build -o build/libtunnel.a -buildmode=c-archive cmd/lib/lib.go
 
 all:
 	GOOS=linux GOARCH=amd64 go build -ldflags "-w -s -X main.GitCommit=$(ver)" -o build/tunnel-node-linux-amd64 cmd/node/main.go
