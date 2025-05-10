@@ -21,6 +21,7 @@ import (
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/db/leveldb"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
+	tonaddr "github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/dht"
@@ -194,10 +195,12 @@ func main() {
 		return
 	}
 
+	var wlt *wallet.Wallet
 	var pmt tunnel.PaymentConfig
+	var apiClient ton.APIClientWrapped
 	if cfg.PaymentsEnabled {
 		log.Info().Msg("Initializing payment node ")
-		pm := preparePayments(context.Background(), gCfg, dhtClient, cfg)
+		pm, w, apiC := preparePayments(context.Background(), gCfg, dhtClient, cfg)
 		go pm.Start()
 
 		var ch []byte
@@ -224,6 +227,8 @@ func main() {
 			MinPricePerPacketRoute: cfg.Payments.MinPricePerPacketRoute,
 			MinPricePerPacketInOut: cfg.Payments.MinPricePerPacketInOut,
 		}
+		wlt = w
+		apiClient = apiC
 	}
 
 	lvl := zerolog.InfoLevel
@@ -322,6 +327,71 @@ func main() {
 				log.Info().Msg("Capacity left: " + tlb.FromNanoTON(amount).String() + " TON")
 			}
 			continue
+		case "wallet-ton-balance":
+			if wlt == nil {
+				log.Error().Msg("payments are not enabled")
+				continue
+			}
+
+			blk, err := apiClient.CurrentMasterchainInfo(context.Background())
+			if err != nil {
+				log.Error().Err(err).Msg("failed to get current masterchain info")
+				continue
+			}
+
+			balance, err := wlt.GetBalance(context.Background(), blk)
+			if err != nil {
+				log.Error().Err(err).Msg("failed to get balance")
+				continue
+			}
+
+			log.Info().Msgf("wallet balance: %s TON", balance.String())
+		case "wallet-ton-transfer":
+			if wlt == nil {
+				log.Error().Msg("payments are not enabled")
+				continue
+			}
+
+			log.Info().Msg("enter address to transfer to:")
+
+			var addrStr string
+			_, _ = fmt.Scanln(&addrStr)
+
+			addr, err := tonaddr.ParseAddr(addrStr)
+			if err != nil {
+				log.Error().Err(err).Msg("incorrect format of address")
+				continue
+			}
+
+			log.Info().Msg("input amount:")
+			var strAmt string
+			_, _ = fmt.Scanln(&strAmt)
+
+			amt, err := tlb.FromTON(strAmt)
+			if err != nil {
+				log.Error().Err(err).Msg("incorrect format of amount")
+				continue
+			}
+
+			log.Info().Msg("input comment:")
+			var comment string
+			_, _ = fmt.Scanln(&comment)
+
+			log.Info().
+				Str("to_address", addr.String()).
+				Str("amount", amt.String()).
+				Msg("transferring...")
+
+			time.Sleep(3 * time.Second) // give user some time to cancel
+
+			pmt.Service.GetPrivateKey()
+
+			tx, _, err := wlt.TransferWaitTransaction(context.Background(), addr, amt, comment)
+			if err != nil {
+				log.Error().Err(err).Msg("failed to transfer")
+				continue
+			}
+			log.Info().Str("hash", base64.URLEncoding.EncodeToString(tx.Hash)).Msg("transfer transaction committed")
 		}
 
 	}
@@ -355,7 +425,7 @@ func formatNumInt(packets int64) string {
 	return fmt.Sprintf("%.2f%s", sizeFloat, sizes[sizeIndex])
 }
 
-func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClient *dht.Client, cfg *config.Config) *tonpayments.Service {
+func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClient *dht.Client, cfg *config.Config) (*tonpayments.Service, *wallet.Wallet, ton.APIClientWrapped) {
 	client := liteclient.NewConnectionPool()
 
 	log.Info().Msg("initializing ton client with verified proof chain...")
@@ -363,7 +433,7 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 	// connect to lite servers
 	if err := client.AddConnectionsFromConfig(ctx, gCfg); err != nil {
 		log.Fatal().Err(err).Msg("ton connect err")
-		return nil
+		return nil, nil, nil
 	}
 
 	policy := ton.ProofCheckPolicyFast
@@ -383,25 +453,25 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 
 	if err := gate.StartClient(); err != nil {
 		log.Fatal().Err(err).Msg("failed to init adnl payments gateway")
-		return nil
+		return nil, nil, nil
 	}
 
 	walletPrv := ed25519.NewKeyFromSeed(cfg.Payments.WalletPrivateKey)
 	fdb, freshDb, err := leveldb.NewDB(cfg.Payments.DBPath, nodePrv.Public().(ed25519.PublicKey))
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to init leveldb")
-		return nil
+		return nil, nil, nil
 	}
 
 	if freshDb {
 		if err = fdb.SetMigrationVersion(context.Background(), len(db.Migrations)); err != nil {
 			log.Fatal().Err(err).Msg("failed to set initial migration version")
-			return nil
+			return nil, nil, nil
 		}
 	} else {
 		if err = db.RunMigrations(fdb); err != nil {
 			log.Fatal().Err(err).Msg("failed to run migrations")
-			return nil
+			return nil, nil, nil
 		}
 	}
 
@@ -411,7 +481,7 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 	if bo, err := fdb.GetBlockOffset(ctx); err != nil {
 		if !errors.Is(err, db.ErrNotFound) {
 			log.Fatal().Err(err).Msg("failed to load block offset")
-			return nil
+			return nil, nil, nil
 		}
 	} else {
 		seqno = bo.Seqno
@@ -426,12 +496,14 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 	sc := chain.NewScanner(apiClient, seqno, scanLog)
 	if err = sc.StartSmall(inv); err != nil {
 		log.Fatal().Err(err).Msg("failed to start scanner")
+		return nil, nil, nil
 	}
 	fdb.SetOnChannelUpdated(sc.OnChannelUpdate)
 
 	chList, err := fdb.GetChannels(context.Background(), nil, db.ChannelStateAny)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to load channels")
+		return nil, nil, nil
 	}
 
 	for _, channel := range chList {
@@ -440,29 +512,22 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 		}
 	}
 
-	w, err := wallet.FromPrivateKey(apiClient, walletPrv, wallet.ConfigHighloadV3{
-		MessageTTL: 3*60 + 30,
-		MessageBuilder: func(ctx context.Context, subWalletId uint32) (id uint32, createdAt int64, err error) {
-			createdAt = time.Now().Unix() - 30 // something older than last master block, to pass through LS external's time validation
-			id = uint32(createdAt) % (1 << 23) // TODO: store seqno in db
-			return
-		},
-	})
+	w, err := chain.InitWallet(apiClient, walletPrv)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to init wallet")
-		return nil
+		return nil, nil, nil
 	}
 	log.Info().Str("addr", w.WalletAddress().String()).Msg("wallet initialized")
 
 	svc, err := tonpayments.NewService(apiClient, fdb, tr, w, inv, nodePrv, cfg.Payments.ChannelsConfig)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to init payments service")
-		return nil
+		return nil, nil, nil
 	}
 	tr.SetService(svc)
 	log.Info().Str("pubkey", base64.StdEncoding.EncodeToString(nodePrv.Public().(ed25519.PublicKey))).Msg("payment node initialized")
 
-	return svc
+	return svc, w, apiClient
 }
 
 func preparePaymentChannel(ctx context.Context, pmt *tonpayments.Service, ch []byte) ([]byte, error) {

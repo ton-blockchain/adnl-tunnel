@@ -63,10 +63,6 @@ github.com/syndtr/goleveldb v1.0.0 h1:fBdIW9lB4Iz0n9khmH8w27SJ3QEJ7+IgjPEwGSZiFd
 github.com/syndtr/goleveldb v1.0.0/go.mod h1:ZVVdQEZoIme9iO1Ch2Jdy24qqXrMMOU6lpPAyBWyWuQ=
 github.com/xssnick/raptorq v1.0.0 h1:l77lntIV/W/SV9rZjF4wRpIhikQm8nBHtB3h+qiu2cM=
 github.com/xssnick/raptorq v1.0.0/go.mod h1:kgEVVsZv2hP+IeV7C7985KIFsDdvYq2ARW234SBA9Q4=
-github.com/xssnick/ton-payment-network v0.1.1 h1:xgCyZqOoNnsQXU9Wxw6ESuhWcLykvdYvJ6TjR6D7o4U=
-github.com/xssnick/ton-payment-network v0.1.1/go.mod h1:5MZK8Pv5EuNFe0qDSFYZuhY3COGBLxIR17yGhkKoacQ=
-github.com/xssnick/ton-payment-network v0.1.2-0.20250509174604-e0288a2a55e4 h1:Nmb3nMq6xihY8CO0oLd9ImrjWzNW5lgvJQlKtAz/zy8=
-github.com/xssnick/ton-payment-network v0.1.2-0.20250509174604-e0288a2a55e4/go.mod h1:5MZK8Pv5EuNFe0qDSFYZuhY3COGBLxIR17yGhkKoacQ=
 github.com/xssnick/ton-payment-network v0.1.2-0.20250509194518-ac5c48f2446e h1:TD9LrIC24h5kLLUKx//ARyZk18jYPgMExDtY9lU8fIw=
 github.com/xssnick/ton-payment-network v0.1.2-0.20250509194518-ac5c48f2446e/go.mod h1:5MZK8Pv5EuNFe0qDSFYZuhY3COGBLxIR17yGhkKoacQ=
 github.com/xssnick/tonutils-go v1.12.1-0.20250508133817-83128a4c7520 h1:xWfOIHtOHwq0Z0Ew4Q1lRNqt6hm4ApEanjhbCDIZWlM=
