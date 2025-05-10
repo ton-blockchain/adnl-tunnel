@@ -55,6 +55,8 @@ var MetricsAddr = flag.String("metrics-listen-addr", "", "Addr to run the promet
 var LogCompress = flag.Bool("log-compress", false, "whether to compress rotated log files")
 var LogDisableFile = flag.Bool("log-disable-file", false, "Disable logging to file")
 
+var GitCommit = "dev"
+
 func main() {
 	flag.Parse()
 
@@ -75,13 +77,15 @@ func main() {
 	log.Logger = zerolog.New(multi).With().Timestamp().Logger().Level(zerolog.InfoLevel)
 	adnl.Logger = func(v ...any) {}
 
+	log.Info().Str("version", GitCommit).Msg("starting tunnel node...")
+
 	if *Verbosity >= 5 {
 		dht.Logger = func(v ...any) {
 			log.Logger.Debug().Msg(fmt.Sprintln(v...))
 		}
 	}
 
-	if *Verbosity >= 4 {
+	if *Verbosity >= 6 {
 		adnl.Logger = func(v ...any) {
 			log.Logger.Debug().Msg(fmt.Sprintln(v...))
 		}
