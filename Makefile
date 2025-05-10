@@ -1,4 +1,4 @@
-.PHONY: binary library
+.PHONY: binary library all
 
 ver := $(shell git describe --tags --always --dirty)
 
