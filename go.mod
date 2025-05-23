@@ -7,7 +7,7 @@ require (
 	github.com/natefinch/lumberjack v2.0.0+incompatible
 	github.com/prometheus/client_golang v1.22.0
 	github.com/rs/zerolog v1.34.0
-	github.com/xssnick/ton-payment-network v0.2.0
+	github.com/xssnick/ton-payment-network v0.2.1-0.20250516053212-08c0989437a4
 	github.com/xssnick/tonutils-go v1.13.0
 )
 
