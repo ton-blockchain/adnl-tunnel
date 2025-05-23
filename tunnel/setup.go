@@ -506,7 +506,7 @@ func preparePayerPaymentChannel(ctx context.Context, api ton.APIClientWrapped, p
 
 			acc, err := api.GetAccount(ctx, block, addr)
 			if err != nil {
-				return nil, fmt.Errorf("failed to get account: %w", err)
+				return nil, fmt.Errorf("failed to get account %s: %w", addr.String(), err)
 			}
 
 			if acc.State == nil || !acc.IsActive {
