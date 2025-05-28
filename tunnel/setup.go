@@ -32,8 +32,14 @@ import (
 	cRand "crypto/rand"
 )
 
-var Acceptor = func(to, from []*SectionInfo) bool {
-	return true
+const (
+	AcceptorDecisionCancel = iota
+	AcceptorDecisionAccept
+	AcceptorDecisionReject
+)
+
+var Acceptor = func(to, from []*SectionInfo) int {
+	return AcceptorDecisionAccept
 }
 
 var AskReroute = func() bool {
@@ -129,6 +135,7 @@ func RunTunnel(stopCtx context.Context, cfg *config.ClientConfig, sharedCfg *con
 	}
 	defer dhtClient.Close()
 
+	var apiClient ton.APIClientWrapped
 	var pay *tonpayments.Service
 	if cfg.PaymentsEnabled {
 		lsClient := liteclient.NewConnectionPool()
@@ -137,11 +144,11 @@ func RunTunnel(stopCtx context.Context, cfg *config.ClientConfig, sharedCfg *con
 			return
 		}
 
-		apiClient := ton.NewAPIClient(lsClient, ton.ProofCheckPolicyFast).WithRetry(3).WithTimeout(5 * time.Second)
+		apiClient = ton.NewAPIClient(lsClient, ton.ProofCheckPolicyFast).WithRetry(3).WithTimeout(5 * time.Second)
 
 		events <- MsgEvent{Msg: "Preparing tunnel payments..."}
 		var onCloseExec []func()
-		pay, onCloseExec, err = preparePayerPayments(closerCtx, apiClient, dhtClient, cfg, sharedCfg, logger, ml, events)
+		pay, onCloseExec, err = preparePayerPayments(closerCtx, apiClient, dhtClient, cfg, logger, ml, events)
 		if err != nil {
 			events <- fmt.Errorf("prepare payments failed: %w", err)
 			return
@@ -178,9 +185,13 @@ reinit:
 
 		var lastAsk int64
 		ctxInit, cancel := context.WithTimeout(closerCtx, 60*time.Second)
-		tun, port, ip, err, retryable := configureRoute(ctxInit, cfg, tGate, nodes, attempts, events)
+		tun, port, ip, err, retryable := configureRoute(ctxInit, cfg, apiClient, tGate, nodes, attempts, events)
 		cancel()
 		if err != nil {
+			if errors.Is(err, ErrNoMoreRoutes) {
+				attempts = map[string]bool{}
+			}
+
 			if !retryable {
 				events <- fmt.Errorf("failed to configure route: %w", err)
 				return
@@ -221,15 +232,17 @@ reinit:
 	}
 }
 
+var ErrRouteCanceled = errors.New("route canceled")
 var ErrRouteIsNotAccepted = errors.New("route is not accepted")
+var ErrNoMoreRoutes = errors.New("no more routes to try")
 
-func configureRoute(ctx context.Context, cfg *config.ClientConfig, tGate *Gateway, nodes []config.TunnelRouteSection, attempts map[string]bool, events chan any) (*RegularOutTunnel, uint16, net.IP, error, bool) {
+func configureRoute(ctx context.Context, cfg *config.ClientConfig, apiClient ton.APIClientWrapped, tGate *Gateway, nodes []config.TunnelRouteSection, attempts map[string]bool, events chan any) (*RegularOutTunnel, uint16, net.IP, error, bool) {
 	tGate.log.Info().Msg("initializing adnl tunnel...")
 
 	var tries int
 reassemble:
 	if tries > 50 {
-		return nil, 0, nil, fmt.Errorf("failed to find unique route after 50 attempts"), false
+		return nil, 0, nil, ErrNoMoreRoutes, true
 	}
 
 	tries++
@@ -324,7 +337,12 @@ reassemble:
 	tGate.log.Info().Str("route", strTo).Msgf("configuring route...")
 
 	attempts[strTo] = true
-	if !Acceptor(chainTo, chainFrom) {
+	if den := Acceptor(chainTo, chainFrom); den != AcceptorDecisionAccept {
+
+		if den == AcceptorDecisionCancel {
+			tGate.log.Info().Str("route", strTo).Msgf("route canceled")
+			return nil, 0, nil, ErrRouteCanceled, false
+		}
 		tGate.log.Info().Str("route", strTo).Msgf("route denied")
 
 		return nil, 0, nil, ErrRouteIsNotAccepted, true
@@ -337,6 +355,12 @@ reassemble:
 	chainFrom = append(chainFrom, &SectionInfo{
 		Keys: toUs,
 	})
+
+	if tGate.payments.Service != nil {
+		if err = checkAndDeployPaymentChannels(ctx, apiClient, tGate.payments.Service, nodes, events); err != nil {
+			return nil, 0, nil, fmt.Errorf("failed to check payment channels: %w", err), false
+		}
+	}
 
 	tun, err := tGate.CreateRegularOutTunnel(ctx, chainTo, chainFrom, tGate.log.With().Str("component", "tunnel").Logger())
 	if err != nil {
@@ -358,7 +382,7 @@ reassemble:
 	return tun, extPort, extIP, nil, true
 }
 
-func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, dhtClient *dht.Client, cfg *config.ClientConfig, sharedCfg *config.SharedConfig, logger zerolog.Logger, manager adnl.NetManager, events chan any) (svc *tonpayments.Service, onCloseExec []func(), err error) {
+func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, dhtClient *dht.Client, cfg *config.ClientConfig, logger zerolog.Logger, manager adnl.NetManager, events chan any) (svc *tonpayments.Service, onCloseExec []func(), err error) {
 	nodePrv := ed25519.NewKeyFromSeed(cfg.Payments.PaymentsNodeKey)
 	serverPrv := ed25519.NewKeyFromSeed(cfg.Payments.ADNLServerKey)
 	gate := adnl.NewGatewayWithNetManager(serverPrv, manager)
@@ -452,10 +476,15 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	go svc.Start()
 	defer onEnd(svc.Stop)
 
+	initOk = true
+	return
+}
+
+func checkAndDeployPaymentChannels(ctx context.Context, apiClient ton.APIClientWrapped, svc *tonpayments.Service, nodes []config.TunnelRouteSection, events chan any) error {
 	var requiredChannels = map[string]bool{}
-	for _, sec := range sharedCfg.NodesPool {
+	for _, sec := range nodes {
 		if len(sec.Payment.Chain) == 0 {
-			return nil, nil, fmt.Errorf("no payment nodes chain specified in config for node " + base64.StdEncoding.EncodeToString(sec.Key))
+			return fmt.Errorf("no payment nodes chain specified in config for node " + base64.StdEncoding.EncodeToString(sec.Key))
 		}
 
 		if sec.Payment != nil {
@@ -479,14 +508,12 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 
 			events <- MsgEvent{Msg: "Preparing payment channel for tunnel..."}
 
-			if _, err = preparePayerPaymentChannel(ctx, apiClient, svc, sec.Payment.Chain[0].NodeKey, jetton, sec.Payment.ExtraCurrencyID, events); err != nil {
-				return nil, nil, fmt.Errorf("failed to prepare payment channel for %s: %w", key, err)
+			if _, err := preparePayerPaymentChannel(ctx, apiClient, svc, sec.Payment.Chain[0].NodeKey, jetton, sec.Payment.ExtraCurrencyID, events); err != nil {
+				return fmt.Errorf("failed to prepare payment channel for %s: %w", key, err)
 			}
 		}
 	}
-
-	initOk = true
-	return
+	return nil
 }
 
 func preparePayerPaymentChannel(ctx context.Context, api ton.APIClientWrapped, pmt *tonpayments.Service, ch []byte, jetton *address.Address, ecID uint32, events chan any) ([]byte, error) {
