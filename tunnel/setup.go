@@ -198,7 +198,9 @@ reinit:
 			}
 
 			events <- ConfigurationErrorEvent{err}
-			time.Sleep(300 * time.Millisecond)
+			if !errors.Is(err, ErrNoMoreRoutes) && !errors.Is(err, ErrRouteIsNotAccepted) {
+				time.Sleep(300 * time.Millisecond)
+			}
 			continue
 		}
 
@@ -262,6 +264,8 @@ reassemble:
 	out := nodes[0]
 	pool := nodes[1:]
 
+	var actingNodes = []config.TunnelRouteSection{out}
+
 	var siBack *SectionInfo
 	if cfg.TunnelSectionsNum > 1 {
 		for i := uint(0); i < cfg.TunnelSectionsNum-1; i++ {
@@ -278,6 +282,7 @@ reassemble:
 			}
 
 			chainTo = append(chainTo, si)
+			actingNodes = append(actingNodes, pool[i])
 		}
 
 		rnd.Shuffle(len(pool), func(i, j int) {
@@ -291,6 +296,7 @@ reassemble:
 			}
 
 			chainFrom = append(chainFrom, si)
+			actingNodes = append(actingNodes, pool[i])
 		}
 	}
 
@@ -357,7 +363,7 @@ reassemble:
 	})
 
 	if tGate.payments.Service != nil {
-		if err = checkAndDeployPaymentChannels(ctx, apiClient, tGate.payments.Service, nodes, events); err != nil {
+		if err = checkAndDeployPaymentChannels(ctx, apiClient, tGate.payments.Service, actingNodes, events); err != nil {
 			return nil, 0, nil, fmt.Errorf("failed to check payment channels: %w", err), false
 		}
 	}
@@ -486,7 +492,7 @@ func checkAndDeployPaymentChannels(ctx context.Context, apiClient ton.APIClientW
 		if sec.Payment == nil {
 			continue
 		}
-		
+
 		if len(sec.Payment.Chain) == 0 {
 			return fmt.Errorf("no payment nodes chain specified in config for node " + base64.StdEncoding.EncodeToString(sec.Key))
 		}
