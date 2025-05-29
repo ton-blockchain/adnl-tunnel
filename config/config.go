@@ -345,8 +345,8 @@ func GenerateClientConfig() (*ClientConfig, error) {
 							AllowTunneling:  false,
 						},
 						BalanceControl: &configPayments.BalanceControlConfig{
-							DepositWhenAmountLessThan: "3",
-							DepositUpToAmount:         "5",
+							DepositWhenAmountLessThan: "1",
+							DepositUpToAmount:         "3",
 							WithdrawWhenAmountReached: "0",
 						},
 						MisbehaviorFine: "3",

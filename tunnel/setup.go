@@ -483,6 +483,10 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 func checkAndDeployPaymentChannels(ctx context.Context, apiClient ton.APIClientWrapped, svc *tonpayments.Service, nodes []config.TunnelRouteSection, events chan any) error {
 	var requiredChannels = map[string]bool{}
 	for _, sec := range nodes {
+		if sec.Payment == nil {
+			continue
+		}
+		
 		if len(sec.Payment.Chain) == 0 {
 			return fmt.Errorf("no payment nodes chain specified in config for node " + base64.StdEncoding.EncodeToString(sec.Key))
 		}
