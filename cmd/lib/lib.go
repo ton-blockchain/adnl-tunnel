@@ -2,6 +2,7 @@ package main
 
 /*
 #include <stdint.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 
 typedef struct {
@@ -86,7 +87,10 @@ func (l *LogWriter) Write(p []byte) (n int, err error) {
 	}
 
 	msg := string(p[2:])
-	C.write_log(l.logger, C.CString(msg), C.size_t(len(p)-2), C.int(p[0]-0x30))
+	cMsg := C.CString(msg)
+	defer C.free(unsafe.Pointer(cMsg))
+
+	C.write_log(l.logger, cMsg, C.size_t(len(p)-2), C.int(p[0]-0x30))
 	return len(p), nil
 }
 
@@ -142,6 +146,7 @@ func PrepareTunnel(logger C.Logger, onRecv C.RecvCallback, onReinit C.ReinitCall
 	if err = json.Unmarshal(data, &cfg); err != nil {
 		log.Fatal().Err(err).Msg("Failed to parse tunnel config")
 	}
+	config.NormalizeClientConfig(&cfg)
 
 	if cfg.NodesPoolConfigPath == "" {
 		log.Fatal().Msg("nodes pool config path is empty")

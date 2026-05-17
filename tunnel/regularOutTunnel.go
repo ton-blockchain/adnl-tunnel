@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"github.com/xssnick/ton-payment-network/pkg/payments"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
 	"github.com/xssnick/tonutils-go/address"
@@ -21,6 +21,7 @@ import (
 	"math/big"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,6 +54,7 @@ type Payer struct {
 	PricePerPacket  uint64
 	JettonMaster    *address.Address
 	ExtraCurrencyID uint32
+	BalanceID       string
 
 	PaidPackets    int64
 	CurrentChannel *VirtualPaymentChannel
@@ -116,6 +118,7 @@ type RegularOutTunnel struct {
 
 	wDeadline time.Time
 	rDeadline time.Time
+	deadlines chan struct{}
 
 	localAddr net.Addr
 
@@ -124,7 +127,8 @@ type RegularOutTunnel struct {
 	closerCtx context.Context
 	close     context.CancelFunc
 
-	mx sync.RWMutex
+	deadlineMx sync.RWMutex
+	mx         sync.RWMutex
 }
 
 var ChannelCapacityForNumPayments int64 = 30
@@ -162,6 +166,7 @@ func (g *Gateway) CreateRegularOutTunnel(ctx context.Context, chainTo, chainFrom
 		payloadKeys:        pec,
 		sendControlSignal:  make(chan struct{}, 1),
 		read:               make(chan DeliverUDPPayload, 512*1024),
+		deadlines:          make(chan struct{}, 1),
 		localAddr:          net.UDPAddrFromAddrPort(ap),
 		tunnelState:        StateTypeConfiguring,
 		log:                log,
@@ -442,12 +447,7 @@ func (t *RegularOutTunnel) CalcPaidAmount() map[string]tlb.Coins {
 			continue
 		}
 
-		var jm string
-		if section.PaymentInfo.JettonMaster != nil {
-			jm = section.PaymentInfo.JettonMaster.String()
-		}
-
-		cc, err := t.gateway.payments.Service.ResolveCoinConfig(jm, section.PaymentInfo.ExtraCurrencyID, true)
+		cc, err := t.gateway.payments.Service.ResolveCoinConfig(section.PaymentInfo.BalanceID)
 		if err != nil {
 			continue
 		}
@@ -479,18 +479,24 @@ func (t *RegularOutTunnel) openVirtualChannel(p *Payer, capacity *big.Int) (*Vir
 		return nil, fmt.Errorf("generate channel key failed: %w", err)
 	}
 
-	vc, firstInstructionKey, tun, err := transport.GenerateTunnel(chKey, tunChain, 5, false, nil)
+	cc, err := t.gateway.payments.Service.ResolveCoinConfig(p.BalanceID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve coin config: %w", err)
+	}
+
+	firstInstructionKey, tun, err := transport.GenerateTunnel(chKey, tunChain, 5, false, nil, cc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate tunnel: %w", err)
 	}
 
-	err = t.gateway.payments.Service.OpenVirtualChannel(context.Background(), tunChain[0].Target, firstInstructionKey, tunChain[len(tunChain)-1].Target, chKey, tun, vc, p.JettonMaster, p.ExtraCurrencyID)
+	err = t.gateway.payments.Service.CreateSendConditional(context.Background(), firstInstructionKey, chKey, tunChain[0], tunChain[len(tunChain)-1], tun, cc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open virtual channel: %w", err)
 	}
 
+	virtualKey := chKey.Public().(ed25519.PublicKey)
 	for {
-		meta, err := t.gateway.payments.Service.GetVirtualChannelMeta(context.Background(), vc.Key)
+		meta, err := t.gateway.payments.Service.GetVirtualChannelMeta(context.Background(), virtualKey)
 		if err != nil {
 			if errors.Is(err, db.ErrNotFound) {
 				time.Sleep(time.Second)
@@ -499,13 +505,13 @@ func (t *RegularOutTunnel) openVirtualChannel(p *Payer, capacity *big.Int) (*Vir
 			return nil, fmt.Errorf("failed to get virtual channel meta: %w", err)
 		}
 
-		if meta.Status == db.VirtualChannelStatePending {
+		if meta.Status == db.ConditionalStatePending {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
-		if meta.Status != db.VirtualChannelStateActive {
-			return nil, fmt.Errorf("failed to open virtual channel: incorrect state %d", db.VirtualChannelStateActive)
+		if meta.Status != db.ConditionalStateActive {
+			return nil, fmt.Errorf("failed to open virtual channel: incorrect state %d", db.ConditionalStateActive)
 		}
 		break
 	}
@@ -780,7 +786,7 @@ func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePaymen
 					amount := new(big.Int).Mul(big.NewInt(payFor), price)
 					stateAmount := new(big.Int).Add(p.CurrentChannel.LastAmount, amount)
 
-					st := payments.VirtualChannelState{
+					st := conditionals.VirtualChannelState{
 						Amount: stateAmount,
 					}
 					st.Sign(p.CurrentChannel.Key)
@@ -790,7 +796,7 @@ func (t *RegularOutTunnel) prepareTunnelControlMessage(withPayments, forcePaymen
 						return nil, time.Time{}, fmt.Errorf("state to cell failed: %w", err)
 					}
 
-					if err = t.gateway.payments.Service.AddVirtualChannelResolve(context.Background(), p.CurrentChannel.Key.Public().(ed25519.PublicKey), st); err != nil {
+					if err = t.gateway.payments.Service.AddConditionalResolve(context.Background(), p.CurrentChannel.Key.Public().(ed25519.PublicKey), pcs); err != nil {
 						return nil, time.Time{}, fmt.Errorf("add virtual channel resolve failed: %w", err)
 					}
 
@@ -1130,13 +1136,16 @@ func (t *RegularOutTunnel) Process(payload []byte, meta any) error {
 }
 
 func (t *RegularOutTunnel) WaitForInit(ctx context.Context, events func(string)) (net.IP, uint16, error) {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, 0, ctx.Err()
 		case <-t.closerCtx.Done():
 			return nil, 0, t.closerCtx.Err()
-		case <-time.After(5 * time.Millisecond):
+		case <-ticker.C:
 			if atomic.LoadUint32(&t.tunnelState) != StateTypeOptimized {
 				continue
 			}
@@ -1149,13 +1158,16 @@ func (t *RegularOutTunnel) WaitForInit(ctx context.Context, events func(string))
 				t.requestControlMessage()
 				log.Info().Msg("adnl tunnel initialized, waiting payment confirmation...")
 
+				paymentTicker := time.NewTicker(5 * time.Millisecond)
 				for {
 					select {
 					case <-ctx.Done():
+						paymentTicker.Stop()
 						return nil, 0, ctx.Err()
 					case <-t.closerCtx.Done():
+						paymentTicker.Stop()
 						return nil, 0, t.closerCtx.Err()
-					case <-time.After(5 * time.Millisecond):
+					case <-paymentTicker.C:
 						if atomic.LoadInt32(&t.paymentsConfirmed) == 0 {
 							continue
 						}
@@ -1163,6 +1175,7 @@ func (t *RegularOutTunnel) WaitForInit(ctx context.Context, events func(string))
 
 					break
 				}
+				paymentTicker.Stop()
 			}
 
 			if events != nil {
@@ -1174,22 +1187,58 @@ func (t *RegularOutTunnel) WaitForInit(ctx context.Context, events func(string))
 }
 
 func (t *RegularOutTunnel) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	packet := <-t.read
-	return copy(p, packet.Payload), &net.UDPAddr{
-		IP:   packet.IP,
-		Port: int(packet.Port),
-	}, nil
+	return t.readFrom(context.Background(), p)
 }
 
 func (t *RegularOutTunnel) ReadFromWithTimeout(ctx context.Context, p []byte) (n int, addr net.Addr, err error) {
-	select {
-	case packet := <-t.read:
-		return copy(p, packet.Payload), &net.UDPAddr{
-			IP:   packet.IP,
-			Port: int(packet.Port),
-		}, nil
-	case <-ctx.Done():
-		return -1, nil, ctx.Err()
+	return t.readFrom(ctx, p)
+}
+
+func (t *RegularOutTunnel) readFrom(ctx context.Context, p []byte) (n int, addr net.Addr, err error) {
+	for {
+		t.deadlineMx.RLock()
+		deadline := t.rDeadline
+		deadlines := t.deadlines
+		t.deadlineMx.RUnlock()
+
+		var deadlineC <-chan time.Time
+		var timer *time.Timer
+		if !deadline.IsZero() {
+			wait := time.Until(deadline)
+			if wait <= 0 {
+				return 0, nil, os.ErrDeadlineExceeded
+			}
+			timer = time.NewTimer(wait)
+			deadlineC = timer.C
+		}
+
+		select {
+		case packet := <-t.read:
+			if timer != nil {
+				timer.Stop()
+			}
+			return copy(p, packet.Payload), &net.UDPAddr{
+				IP:   packet.IP,
+				Port: int(packet.Port),
+			}, nil
+		case <-t.closerCtx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
+			return 0, nil, t.closerCtx.Err()
+		case <-ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
+			return 0, nil, ctx.Err()
+		case <-deadlineC:
+			return 0, nil, os.ErrDeadlineExceeded
+		case <-deadlines:
+			if timer != nil {
+				timer.Stop()
+			}
+			continue
+		}
 	}
 }
 
@@ -1198,6 +1247,42 @@ func (t *RegularOutTunnel) requestControlMessage() {
 	case t.sendControlSignal <- struct{}{}:
 	default:
 	}
+}
+
+func (t *RegularOutTunnel) reservePaidOutPacket() (func(), error) {
+	for {
+		consumed := atomic.LoadInt64(&t.packetsConsumedOut)
+		paid := atomic.LoadInt64(&t.packetsMinPaidOut)
+		if paid < consumed+1 {
+			return nil, fmt.Errorf("not enough packets prepaid, paid: %d, consumed: %d", paid, consumed)
+		}
+
+		if atomic.CompareAndSwapInt64(&t.packetsConsumedOut, consumed, consumed+1) {
+			if paid-(consumed+1) < t.packetsToPrepay/2 {
+				t.requestControlMessage()
+			}
+			return func() {
+				atomic.AddInt64(&t.packetsConsumedOut, -1)
+			}, nil
+		}
+	}
+}
+
+func (t *RegularOutTunnel) writeContext() (context.Context, context.CancelFunc, error) {
+	t.deadlineMx.RLock()
+	deadline := t.wDeadline
+	t.deadlineMx.RUnlock()
+
+	if deadline.IsZero() {
+		return context.Background(), func() {}, nil
+	}
+
+	if time.Until(deadline) <= 0 {
+		return nil, nil, os.ErrDeadlineExceeded
+	}
+
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	return ctx, cancel, nil
 }
 
 func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
@@ -1214,17 +1299,11 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return -1, fmt.Errorf("tunnel is destroyed")
 	}
 
-	if t.usePayments {
-		paid := atomic.LoadInt64(&t.packetsMinPaidOut)
-		consumed := atomic.LoadInt64(&t.packetsConsumedOut)
-		if paid < consumed {
-			return -1, fmt.Errorf("not enough packets prepaid, paid: %d, consumed: %d", paid, consumed)
-		}
-
-		if paid-atomic.AddInt64(&t.packetsConsumedOut, 1) < t.packetsToPrepay/2 {
-			t.requestControlMessage()
-		}
+	ctx, cancel, err := t.writeContext()
+	if err != nil {
+		return -1, err
 	}
+	defer cancel()
 
 	updAddr, ok := addr.(*net.UDPAddr)
 	if !ok {
@@ -1248,11 +1327,22 @@ func (t *RegularOutTunnel) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return -1, fmt.Errorf("encrypt payload error: %w", err)
 	}
 
-	if err = t.peer.SendCustomMessage(context.Background(), EncryptedMessageCached{
+	var refund func()
+	if t.usePayments {
+		refund, err = t.reservePaidOutPacket()
+		if err != nil {
+			return -1, err
+		}
+	}
+
+	if err = t.peer.SendCustomMessage(ctx, EncryptedMessageCached{
 		SectionPubKey: t.chainTo[0].Keys.SectionPubKey,
 		Seqno:         atomic.AddUint32(&t.seqnoForward, 1),
 		Payload:       payload,
 	}); err != nil {
+		if refund != nil {
+			refund()
+		}
 		return -1, fmt.Errorf("send encrypted message error: %w", err)
 	}
 	atomic.AddUint64(&t.packetsSent, 1)
@@ -1305,17 +1395,32 @@ func (t *RegularOutTunnel) LocalAddr() net.Addr {
 	return t.localAddr
 }
 
+func (t *RegularOutTunnel) signalDeadlineChangeLocked() {
+	if t.deadlines != nil {
+		close(t.deadlines)
+	}
+	t.deadlines = make(chan struct{})
+}
+
 func (t *RegularOutTunnel) SetDeadline(tm time.Time) error {
+	t.deadlineMx.Lock()
 	t.wDeadline, t.rDeadline = tm, tm
+	t.signalDeadlineChangeLocked()
+	t.deadlineMx.Unlock()
 	return nil
 }
 
 func (t *RegularOutTunnel) SetReadDeadline(tm time.Time) error {
+	t.deadlineMx.Lock()
 	t.rDeadline = tm
+	t.signalDeadlineChangeLocked()
+	t.deadlineMx.Unlock()
 	return nil
 }
 
 func (t *RegularOutTunnel) SetWriteDeadline(tm time.Time) error {
+	t.deadlineMx.Lock()
 	t.wDeadline = tm
+	t.deadlineMx.Unlock()
 	return nil
 }

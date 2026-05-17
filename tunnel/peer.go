@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"github.com/rs/zerolog/log"
 	"github.com/xssnick/tonutils-go/adnl"
+	adnlAddress "github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/tl"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,7 +67,7 @@ func (g *Gateway) addPeer(id []byte, conn adnl.Peer) *Peer {
 	}
 	peer.mx.Unlock()
 
-	if conn == nil {
+	if conn == nil && g.dht != nil {
 		// try discover
 		go peer.discover(context.Background())
 	}
@@ -76,6 +78,10 @@ func (g *Gateway) addPeer(id []byte, conn adnl.Peer) *Peer {
 func (p *Peer) discover(ctx context.Context) error {
 	if p.getConn() != nil {
 		return nil
+	}
+
+	if p.gw.dht == nil {
+		return ErrNotConnected
 	}
 
 	if atomic.CompareAndSwapInt32(&p.discoverInProgress, 0, 1) {
@@ -93,7 +99,13 @@ func (p *Peer) discover(ctx context.Context) error {
 		return fmt.Errorf("find peer addresses failed: empty address list")
 	}
 
-	addr := addresses.Addresses[0].IP.String() + ":" + fmt.Sprint(uint16(addresses.Addresses[0].Port))
+	ip := adnlAddress.IPValue(addresses.Addresses[0])
+	port := adnlAddress.PortValue(addresses.Addresses[0])
+	if ip == nil || port == 0 {
+		return fmt.Errorf("find peer addresses failed: invalid address")
+	}
+
+	addr := net.JoinHostPort(ip.String(), fmt.Sprint(uint16(port)))
 	conn, err := p.gw.gate.RegisterClient(addr, key)
 	if err != nil {
 		return fmt.Errorf("register peer failed: %w", err)

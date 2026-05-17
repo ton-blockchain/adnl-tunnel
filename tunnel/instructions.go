@@ -10,8 +10,9 @@ import (
 	"github.com/kevinms/leakybucket-go"
 	"github.com/rs/zerolog/log"
 	"github.com/ton-blockchain/adnl-tunnel/metrics"
-	"github.com/xssnick/ton-payment-network/pkg/payments"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
+	adnlAddress "github.com/xssnick/tonutils-go/adnl/address"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/tl"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -70,6 +71,49 @@ type Instruction interface {
 
 type CachedAction interface {
 	Execute(ctx context.Context, s *Section, msg *EncryptedMessageCached) error
+}
+
+func writeUint32(buf *bytes.Buffer, val uint32) {
+	var tmp [4]byte
+	binary.LittleEndian.PutUint32(tmp[:], val)
+	buf.Write(tmp[:])
+}
+
+func writeUint64(buf *bytes.Buffer, val uint64) {
+	var tmp [8]byte
+	binary.LittleEndian.PutUint64(tmp[:], val)
+	buf.Write(tmp[:])
+}
+
+func parseTLBytesNoCopy(data []byte) ([]byte, []byte, error) {
+	if len(data) == 0 {
+		return nil, nil, fmt.Errorf("failed to load length, too short data")
+	}
+
+	offset := 1
+	ln := int(data[0])
+	if ln == 0xFE {
+		if len(data) < 4 {
+			return nil, nil, fmt.Errorf("failed to load long bytes length, too short data")
+		}
+		ln = int(binary.LittleEndian.Uint32(data)) >> 8
+		offset = 4
+	}
+
+	bufSz := ln + offset
+	if add := bufSz % 4; add != 0 {
+		bufSz += 4 - add
+	}
+	if len(data) < offset+ln {
+		return nil, nil, fmt.Errorf("failed to get payload with len %d, too short data", ln)
+	}
+	if bufSz >= len(data) {
+		return data[offset : offset+ln], nil, nil
+	}
+	if len(data) < bufSz {
+		return nil, nil, fmt.Errorf("failed to get payload, too short data")
+	}
+	return data[offset : offset+ln], data[bufSz:], nil
 }
 
 // InstructionsContainer list of instructions to process on this node, order is matters
@@ -135,9 +179,7 @@ type DestroyInstruction struct{}
 
 func (ins DestroyInstruction) Execute(ctx context.Context, s *Section, msg *EncryptedMessage, restInstructions []byte) error {
 	if s.closeIfNotLocked() {
-		s.gw.mx.Lock()
-		delete(s.gw.inboundSections, string(s.key))
-		s.gw.mx.Unlock()
+		s.gw.removeInboundSection(s)
 	}
 	return nil
 }
@@ -252,6 +294,7 @@ func (ins CacheInstruction) Execute(ctx context.Context, s *Section, msg *Encryp
 	if s.cachedActionsVer < ins.Version {
 		s.cachedActions = list
 		s.cachedActionsVer = ins.Version
+		atomic.StoreInt32(&s.protected, 1)
 
 		// reset seqno on cache update
 		s.seqnoCached.mx.Lock()
@@ -283,6 +326,7 @@ func (ins BuildRouteInstruction) Execute(ctx context.Context, s *Section, msg *E
 	if !s.gw.allowRouting {
 		return fmt.Errorf("instruction is not executable since routing is not allowed")
 	}
+	atomic.StoreInt32(&s.protected, 1)
 
 	if s.gw.payments.MinPricePerPacketRoute > ins.PricePerPacket {
 		return fmt.Errorf("too low price per packet route: %d, min is %d", ins.PricePerPacket, s.gw.payments.MinPricePerPacketRoute)
@@ -373,8 +417,9 @@ func (r *Route) Route(ctx context.Context, payload []byte, cached bool, instruct
 
 	var paid bool
 	if target.PricePerPacket > 0 {
-		if r.PaymentReceived {
-			maxLoss := -int64((r.PacketsRouted/100)*LossAcceptablePercent + LossAcceptableStartup)
+		if atomic.LoadInt32(&r.PaymentReceived) != 0 {
+			routed := atomic.LoadUint64(&r.PacketsRouted)
+			maxLoss := -int64((routed/100)*LossAcceptablePercent + LossAcceptableStartup)
 			if atomic.LoadInt64(&r.PrepaidPackets) > maxLoss {
 				// we not so care about concurrency here, and it is okay to allow couple packets overdraft
 				paid = atomic.AddInt64(&r.PrepaidPackets, -1) >= maxLoss
@@ -464,8 +509,8 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 
 	// TODO: recover payments after restart
 
-	var st payments.VirtualChannelState
-	if err := tlb.LoadFromCell(&st, ins.PaymentChannelState.BeginParse()); err != nil {
+	var st conditionals.VirtualChannelState
+	if err := tlb.Parse(&st, ins.PaymentChannelState); err != nil {
 		return fmt.Errorf("incorrect state cell: %w", err)
 	}
 
@@ -488,15 +533,10 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			return fmt.Errorf("get virtual %x channel failed: %w", ins.Key, err)
 		}
 
-		var last *payments.VirtualChannelState
-		if len(vc.LastKnownResolve) > 0 {
-			cl, err := cell.FromBOC(vc.LastKnownResolve)
-			if err != nil {
-				return fmt.Errorf("incorrect latest state cell: %w", err)
-			}
-
-			last = &payments.VirtualChannelState{}
-			if err = tlb.LoadFromCell(last, cl.BeginParse()); err != nil {
+		var last *conditionals.VirtualChannelState
+		if vc.LastKnownResolve != nil {
+			last = &conditionals.VirtualChannelState{}
+			if err = tlb.Parse(last, vc.LastKnownResolve); err != nil {
 				return fmt.Errorf("incorrect latest state cell: %w", err)
 			}
 		}
@@ -511,18 +551,22 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 			return fmt.Errorf("payment channel should not have outgoing direction")
 		}
 
-		capacity, err := tlb.FromTON(vc.Incoming.Capacity)
+		var cond conditionals.ConditionalVirtualChannel
+		condSlice, err := vc.Incoming.Conditional.BeginParse()
 		if err != nil {
-			return fmt.Errorf("incorrect capacity: %w", err)
+			return fmt.Errorf("incorrect conditional: %w", err)
+		}
+		if err = cond.Parse(ctx, condSlice, s.gw.payments.Service); err != nil {
+			return fmt.Errorf("incorrect conditional: %w", err)
 		}
 
 		justLoadedAndCountable = time.Until(vc.Incoming.SafeDeadline) >= MinChannelTimeoutSec*time.Second
 
 		v = &PaymentChannel{
 			Key:         ins.Key,
-			Active:      vc.Status == db.VirtualChannelStateActive && justLoadedAndCountable,
+			Active:      vc.Status == db.ConditionalStateActive && justLoadedAndCountable,
 			Deadline:    vc.Incoming.SafeDeadline.Unix(),
-			Capacity:    capacity.Nano(),
+			Capacity:    cond.Capacity,
 			Purpose:     ins.Purpose,
 			LatestState: last,
 		}
@@ -629,7 +673,7 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 
 		num := amt.Div(amt, new(big.Int).SetUint64(target.PricePerPacket))
 		mutation = func() {
-			route.PaymentReceived = true
+			atomic.StoreInt32(&route.PaymentReceived, 1)
 			x := addPrepaid(&route.PrepaidPackets, num)
 			s.log.Info().Uint32("route", routeId).
 				Int64("num", num.Int64()).
@@ -643,13 +687,19 @@ func (ins PaymentInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 		return fmt.Errorf("unknown payment purpose: %d", v.Purpose>>32)
 	}
 
-	if err := s.gw.payments.Service.AddVirtualChannelResolve(ctx, ins.Key, st); err != nil {
+	stCell, err := tlb.ToCell(st)
+	if err != nil {
+		return fmt.Errorf("state to cell failed: %w", err)
+	}
+
+	if err := s.gw.payments.Service.AddConditionalResolve(ctx, ins.Key, stCell); err != nil {
 		return fmt.Errorf("add virtual channel resolve failed: %w", err)
 	}
 
 	// from this point payment is accepted
 	mutation()
 	v.LatestState = &st
+	atomic.StoreInt32(&s.protected, 1)
 
 	if ins.Final {
 		go func() { // it locks inside, so we close async
@@ -695,6 +745,7 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 	if !s.gw.allowOut {
 		return fmt.Errorf("instruction is not executable since out is not allowed")
 	}
+	atomic.StoreInt32(&s.protected, 1)
 
 	gateAddresses := s.gw.gate.GetAddressList().Addresses
 	if len(gateAddresses) == 0 {
@@ -791,7 +842,7 @@ func (ins BindOutInstruction) Execute(ctx context.Context, s *Section, _ *Encryp
 
 	if err = s.out.sendBack(OutBindDonePayload{
 		Seqno: atomic.AddUint64(&s.out.PacketsSentIn, 1),
-		IP:    gateAddresses[0].IP,
+		IP:    adnlAddress.IPValue(gateAddresses[0]),
 		Port:  uint32(port),
 	}, false); err != nil {
 		s.log.Debug().Err(err).Msg("send back failed")
@@ -815,7 +866,6 @@ func (ins ReportStatsInstruction) Execute(ctx context.Context, s *Section, msg *
 		return fmt.Errorf("instruction is not executable since routing is not allowed")
 	}
 
-	println(reflect.TypeOf(ins).String())
 	return nil
 }
 
@@ -825,7 +875,15 @@ func (_ *SendOutCachedAction) Execute(ctx context.Context, s *Section, msg *Encr
 	if !s.gw.allowOut {
 		return fmt.Errorf("instruction is not executable since out is not allowed")
 	}
-	return s.out.Send(msg.Payload)
+
+	s.mx.RLock()
+	out := s.out
+	s.mx.RUnlock()
+	if out == nil {
+		return fmt.Errorf("out is not initialized")
+	}
+
+	return out.Send(msg.Payload)
 }
 
 // SendOutInstruction used to send UDP packet by server which already bind port using BindOutInstruction
@@ -835,7 +893,15 @@ func (ins SendOutInstruction) Execute(ctx context.Context, s *Section, msg *Encr
 	if !s.gw.allowOut {
 		return fmt.Errorf("instruction is not executable since out is not allowed")
 	}
-	return s.out.Send(msg.Payload)
+
+	s.mx.RLock()
+	out := s.out
+	s.mx.RUnlock()
+	if out == nil {
+		return fmt.Errorf("out is not initialized")
+	}
+
+	return out.Send(msg.Payload)
 }
 
 // DeliverInstruction used to identify that node is the destination
@@ -843,7 +909,6 @@ func (ins SendOutInstruction) Execute(ctx context.Context, s *Section, msg *Encr
 type DeliverInstruction struct{}
 
 func (ins DeliverInstruction) Execute(ctx context.Context, s *Section, msg *EncryptedMessage, restInstructions []byte) error {
-	println(reflect.TypeOf(ins).String())
 	return nil
 }
 
@@ -879,6 +944,7 @@ func (ins DeliverInitiatorInstruction) Execute(ctx context.Context, s *Section, 
 	if err := t.Process(msg.Payload, ins.Metadata); err != nil {
 		return fmt.Errorf("process recv message failed: %w", err)
 	}
+	atomic.StoreInt32(&s.protected, 1)
 
 	return nil
 }
@@ -897,11 +963,67 @@ type DeliverUDPPayload struct {
 	Payload []byte `tl:"bytes"`
 }
 
+func (pl DeliverUDPPayload) Serialize(buf *bytes.Buffer) error {
+	writeUint64(buf, pl.Seqno)
+	if err := tl.ToBytesToBuffer(buf, pl.IP); err != nil {
+		return err
+	}
+	writeUint32(buf, pl.Port)
+	return tl.ToBytesToBuffer(buf, pl.Payload)
+}
+
+func (pl *DeliverUDPPayload) Parse(data []byte) ([]byte, error) {
+	var err error
+	if len(data) < 8 {
+		return nil, fmt.Errorf("corrupted deliver udp payload, len %d", len(data))
+	}
+	pl.Seqno = binary.LittleEndian.Uint64(data)
+	data = data[8:]
+	if pl.IP, data, err = parseTLBytesNoCopy(data); err != nil {
+		return nil, fmt.Errorf("parse ip failed: %w", err)
+	}
+	if len(data) < 4 {
+		return nil, fmt.Errorf("corrupted deliver udp payload port, len %d", len(data))
+	}
+	pl.Port = binary.LittleEndian.Uint32(data)
+	data = data[4:]
+	if pl.Payload, data, err = parseTLBytesNoCopy(data); err != nil {
+		return nil, fmt.Errorf("parse payload failed: %w", err)
+	}
+	return data, nil
+}
+
 type OutBindDonePayload struct {
 	Seqno uint64 `tl:"long"`
 
 	IP   []byte `tl:"bytes"`
 	Port uint32 `tl:"int"`
+}
+
+func (pl OutBindDonePayload) Serialize(buf *bytes.Buffer) error {
+	writeUint64(buf, pl.Seqno)
+	if err := tl.ToBytesToBuffer(buf, pl.IP); err != nil {
+		return err
+	}
+	writeUint32(buf, pl.Port)
+	return nil
+}
+
+func (pl *OutBindDonePayload) Parse(data []byte) ([]byte, error) {
+	var err error
+	if len(data) < 8 {
+		return nil, fmt.Errorf("corrupted out bind done payload, len %d", len(data))
+	}
+	pl.Seqno = binary.LittleEndian.Uint64(data)
+	data = data[8:]
+	if pl.IP, data, err = parseTLBytesNoCopy(data); err != nil {
+		return nil, fmt.Errorf("parse ip failed: %w", err)
+	}
+	if len(data) < 4 {
+		return nil, fmt.Errorf("corrupted out bind done payload port, len %d", len(data))
+	}
+	pl.Port = binary.LittleEndian.Uint32(data)
+	return data[4:], nil
 }
 
 type SendOutPayload struct {
@@ -912,14 +1034,74 @@ type SendOutPayload struct {
 	Payload []byte `tl:"bytes"`
 }
 
-func (o *Out) Close() {
-	o.closerClose()
-	o.conn.Close()
-	o.inboundPeer.Dereference()
+func (pl SendOutPayload) Serialize(buf *bytes.Buffer) error {
+	writeUint64(buf, pl.Seqno)
+	if err := tl.ToBytesToBuffer(buf, pl.IP); err != nil {
+		return err
+	}
+	writeUint32(buf, pl.Port)
+	return tl.ToBytesToBuffer(buf, pl.Payload)
+}
 
-	metrics.ActiveOutGateways.WithLabelValues(strconv.FormatBool(o.PricePerPacket.Sign() > 0)).Dec()
+func (pl *SendOutPayload) Parse(data []byte) ([]byte, error) {
+	var err error
+	if len(data) < 8 {
+		return nil, fmt.Errorf("corrupted send out payload, len %d", len(data))
+	}
+	pl.Seqno = binary.LittleEndian.Uint64(data)
+	data = data[8:]
+	if pl.IP, data, err = parseTLBytesNoCopy(data); err != nil {
+		return nil, fmt.Errorf("parse ip failed: %w", err)
+	}
+	if len(data) < 4 {
+		return nil, fmt.Errorf("corrupted send out payload port, len %d", len(data))
+	}
+	pl.Port = binary.LittleEndian.Uint32(data)
+	data = data[4:]
+	if pl.Payload, data, err = parseTLBytesNoCopy(data); err != nil {
+		return nil, fmt.Errorf("parse payload failed: %w", err)
+	}
+	return data, nil
+}
+
+func (o *Out) Close() {
+	s := o.snapshot()
+	o.closerClose()
+	if s.conn != nil {
+		s.conn.Close()
+	}
+	if s.inboundPeer != nil {
+		s.inboundPeer.Dereference()
+	}
+
+	metrics.ActiveOutGateways.WithLabelValues(strconv.FormatBool(s.pricePerPacket != nil && s.pricePerPacket.Sign() > 0)).Dec()
 
 	o.log.Debug().Msg("closing out")
+}
+
+type outSnapshot struct {
+	conn                net.PacketConn
+	inboundPeer         *Peer
+	payloadCipherKey    []byte
+	payloadCipherKeyCRC uint64
+	inboundSectionKey   []byte
+	instructions        []byte
+	pricePerPacket      *big.Int
+}
+
+func (o *Out) snapshot() outSnapshot {
+	o.mx.RLock()
+	s := outSnapshot{
+		conn:                o.conn,
+		inboundPeer:         o.inboundPeer,
+		payloadCipherKey:    o.PayloadCipherKey,
+		payloadCipherKeyCRC: o.PayloadCipherKeyCRC,
+		inboundSectionKey:   o.InboundSectionKey,
+		instructions:        o.Instructions,
+		pricePerPacket:      o.PricePerPacket,
+	}
+	o.mx.RUnlock()
+	return s
 }
 
 type inPacket struct {
@@ -929,10 +1111,12 @@ type inPacket struct {
 }
 
 func (o *Out) Send(payload []byte) error {
-	o.mx.RLock()
-	defer o.mx.RUnlock()
+	s := o.snapshot()
+	if s.conn == nil {
+		return fmt.Errorf("out is closed")
+	}
 
-	data, err := decryptStream(o.PayloadCipherKeyCRC, o.PayloadCipherKey, payload)
+	data, err := decryptStream(s.payloadCipherKeyCRC, s.payloadCipherKey, payload)
 	if err != nil {
 		return fmt.Errorf("decrypt payload failed: %w", err)
 	}
@@ -952,7 +1136,7 @@ func (o *Out) Send(payload []byte) error {
 	}
 	addr := net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip, uint16(pl.Port)))
 
-	if o.PricePerPacket.Sign() > 0 {
+	if s.pricePerPacket != nil && s.pricePerPacket.Sign() > 0 {
 		if atomic.LoadInt64(&o.PrepaidPacketsIn) < -int64((o.PacketsSentIn/100)*LossAcceptablePercent+LossAcceptableStartup) {
 			return fmt.Errorf("prepaid `in` packets exceeds, cannot send more out messages")
 		}
@@ -964,7 +1148,7 @@ func (o *Out) Send(payload []byte) error {
 		atomic.AddInt64(&o.PrepaidPacketsOut, -1)
 	}
 
-	if _, err = o.conn.WriteTo(pl.Payload, addr); err != nil {
+	if _, err = s.conn.WriteTo(pl.Payload, addr); err != nil {
 		return fmt.Errorf("write out failed: %w", err)
 	}
 	atomic.AddUint64(&o.PacketsSentOut, 1)
@@ -990,7 +1174,7 @@ func (o *Out) Listen(threads int) {
 				case p = <-pks:
 				}
 
-				if o.PricePerPacket.Sign() > 0 {
+				if s := o.snapshot(); s.pricePerPacket != nil && s.pricePerPacket.Sign() > 0 {
 					maxCredit := (atomic.LoadUint64(&o.PacketsSentIn)/100)*LossAcceptablePercent + LossAcceptableStartup
 					if prepaid := atomic.LoadInt64(&o.PrepaidPacketsIn); prepaid <= -int64(maxCredit) {
 						o.log.Trace().Int64("credit", prepaid).Uint64("sent", atomic.LoadUint64(&o.PacketsSentIn)).Msg("incoming packet was dropped because not paid")
@@ -1061,10 +1245,12 @@ func (o *Out) sendBack(obj tl.Serializable, isPayload bool) error {
 		return fmt.Errorf("serialize payload failed: %w", err)
 	}
 
-	o.mx.RLock()
-	defer o.mx.RUnlock()
+	s := o.snapshot()
+	if s.inboundPeer == nil {
+		return fmt.Errorf("inbound peer is not initialized")
+	}
 
-	pl, err = encryptStream(o.PayloadCipherKeyCRC, o.PayloadCipherKey, pl)
+	pl, err = encryptStream(s.payloadCipherKeyCRC, s.payloadCipherKey, pl)
 	if err != nil {
 		return fmt.Errorf("encrypt payload failed: %w", err)
 	}
@@ -1074,19 +1260,19 @@ func (o *Out) sendBack(obj tl.Serializable, isPayload bool) error {
 	var msg tl.Serializable
 	if isPayload {
 		msg = EncryptedMessageCached{
-			SectionPubKey: o.InboundSectionKey,
+			SectionPubKey: s.inboundSectionKey,
 			Seqno:         atomic.AddUint32(&o.backSeqno, 1),
 			Payload:       pl,
 		}
 	} else {
 		msg = EncryptedMessage{
-			SectionPubKey: o.InboundSectionKey,
-			Instructions:  o.Instructions,
+			SectionPubKey: s.inboundSectionKey,
+			Instructions:  s.instructions,
 			Payload:       pl,
 		}
 	}
 
-	if err = o.inboundPeer.SendCustomMessage(o.closer, msg); err != nil {
+	if err = s.inboundPeer.SendCustomMessage(o.closer, msg); err != nil {
 		return fmt.Errorf("send message to inbound tunnel failed: %w", err)
 	}
 	return nil

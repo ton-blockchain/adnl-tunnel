@@ -15,6 +15,7 @@ import (
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain/client"
+	configPayments "github.com/xssnick/ton-payment-network/tonpayments/config"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/db/leveldb"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
@@ -445,8 +446,8 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	}
 
 	inv := make(chan any)
-	sc := chain.NewScanner(apiClient, seqno, logger)
-	if err = sc.StartSmall(inv); err != nil {
+	sc := chain.NewScanner(apiClient, seqno, logger, inv)
+	if err = sc.Start(ctx); err != nil {
 		return nil, nil, fmt.Errorf("failed to start account scanner: %w", err)
 	}
 	defer onEnd(sc.Stop)
@@ -469,7 +470,7 @@ func preparePayerPayments(ctx context.Context, apiClient ton.APIClientWrapped, d
 	}
 	logger.Info().Msg("wallet initialized with address: " + w.WalletAddress().String())
 
-	svc, err = tonpayments.NewService(client.NewTON(apiClient), fdb, tr, nil, w, inv, nodePrv, cfg.Payments.ChannelsConfig, false)
+	svc, err = tonpayments.NewService(client.NewTON(apiClient), fdb, tr, nil, w, inv, nodePrv, cfg.Payments.ChannelsConfig, configPayments.VaultConfig{}, false)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to init tonpayments: %w", err)
 	}
@@ -492,19 +493,11 @@ func checkAndDeployPaymentChannels(ctx context.Context, apiClient ton.APIClientW
 		}
 
 		if len(sec.Payment.Chain) == 0 {
-			return fmt.Errorf("no payment nodes chain specified in config for node " + base64.StdEncoding.EncodeToString(sec.Key))
+			return fmt.Errorf("no payment nodes chain specified in config for node %s", base64.StdEncoding.EncodeToString(sec.Key))
 		}
 
 		if sec.Payment != nil {
-			var jetton *address.Address
 			var key = base64.StdEncoding.EncodeToString(sec.Payment.Chain[0].NodeKey)
-			if sec.Payment.ExtraCurrencyID != 0 {
-				key += ", EC: " + fmt.Sprint(sec.Payment.ExtraCurrencyID)
-			}
-			if sec.Payment.JettonMaster != nil {
-				key += ", jetton: " + *sec.Payment.JettonMaster
-				jetton = address.MustParseAddr(*sec.Payment.JettonMaster)
-			}
 
 			if _, ok := requiredChannels[key]; !ok {
 				requiredChannels[key] = true
@@ -516,7 +509,7 @@ func checkAndDeployPaymentChannels(ctx context.Context, apiClient ton.APIClientW
 
 			events <- MsgEvent{Msg: "Preparing payment channel for tunnel..."}
 
-			if _, err := preparePayerPaymentChannel(ctx, apiClient, svc, sec.Payment.Chain[0].NodeKey, jetton, sec.Payment.ExtraCurrencyID, events); err != nil {
+			if _, err := preparePayerPaymentChannel(ctx, apiClient, svc, sec.Payment.Chain[0].NodeKey, events); err != nil {
 				return fmt.Errorf("failed to prepare payment channel for %s: %w", key, err)
 			}
 		}
@@ -524,15 +517,15 @@ func checkAndDeployPaymentChannels(ctx context.Context, apiClient ton.APIClientW
 	return nil
 }
 
-func preparePayerPaymentChannel(ctx context.Context, api ton.APIClientWrapped, pmt *tonpayments.Service, ch []byte, jetton *address.Address, ecID uint32, events chan any) ([]byte, error) {
+func preparePayerPaymentChannel(ctx context.Context, api ton.APIClientWrapped, pmt *tonpayments.Service, ch []byte, events chan any) ([]byte, error) {
 	list, err := pmt.ListChannels(ctx, nil, db.ChannelStateActive)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list channels: %w", err)
 	}
 
 	for _, channel := range list {
-		if bytes.Equal(channel.TheirOnchain.Key, ch) {
-			addr := address.MustParseAddr(channel.Address)
+		if bytes.Equal(channel.Their.OnchainInfo.Key, ch) {
+			addr := address.MustParseAddr(channel.Our.Address)
 
 			block, err := api.CurrentMasterchainInfo(ctx)
 			if err != nil {
@@ -548,7 +541,7 @@ func preparePayerPaymentChannel(ctx context.Context, api ton.APIClientWrapped, p
 				continue
 			}
 
-			on, err := payments.NewPaymentChannelClient(client.NewTON(api)).ParseAsyncChannel(addr, acc.Code, acc.Data, true)
+			on, err := payments.NewPaymentChannelClient(client.NewTON(api)).ParseChannel(addr, acc.Code, acc.Data, true)
 			if err != nil {
 				log.Warn().Err(err).Str("address", addr.String()).Msg("failed to parse payment channel")
 				continue
@@ -556,7 +549,7 @@ func preparePayerPaymentChannel(ctx context.Context, api ton.APIClientWrapped, p
 
 			// check is channel is really alive, in case we have outdated status in db
 			if on.Status == payments.ChannelStatusOpen {
-				return channel.TheirOnchain.Key, nil
+				return channel.Their.OnchainInfo.Key, nil
 			}
 		}
 	}
@@ -564,7 +557,7 @@ func preparePayerPaymentChannel(ctx context.Context, api ton.APIClientWrapped, p
 	events <- MsgEvent{Msg: "Deploying payment channel for tunnel..."}
 
 	ctxTm, cancel := context.WithTimeout(ctx, 150*time.Second)
-	addr, err := pmt.OpenChannelWithNode(ctxTm, ch, jetton, ecID)
+	addr, err := pmt.OpenChannelWithNode(ctxTm, ch)
 	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("failed to deploy channel with node: %w", err)
@@ -581,7 +574,9 @@ func preparePayerPaymentChannel(ctx context.Context, api ton.APIClientWrapped, p
 			return nil, fmt.Errorf("failed to get channel: %w", err)
 		}
 
-		if !channel.Our.IsReady() || !channel.Their.IsReady() {
+		if channel.Status != db.ChannelStateActive ||
+			len(channel.Our.OnchainInfo.Key) != ed25519.PublicKeySize ||
+			len(channel.Their.OnchainInfo.Key) != ed25519.PublicKeySize {
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
@@ -590,6 +585,27 @@ func preparePayerPaymentChannel(ctx context.Context, api ton.APIClientWrapped, p
 	log.Info().Str("address", addr.String()).Msg("Channel states exchange completed")
 
 	return ch, nil
+}
+
+func paymentBalanceID(payment *config.TunnelSectionPayment) (string, *address.Address, error) {
+	if payment.JettonMaster != nil && payment.ExtraCurrencyID != 0 {
+		return "", nil, fmt.Errorf("jetton and extra currency cannot be used together")
+	}
+
+	if payment.JettonMaster != nil {
+		jetton, err := address.ParseAddr(*payment.JettonMaster)
+		if err != nil {
+			return "", nil, fmt.Errorf("invalid jetton master address: %w", err)
+		}
+		jetton = jetton.Bounce(true)
+		return payments.GetJettonBalanceID(jetton), jetton, nil
+	}
+
+	if payment.ExtraCurrencyID != 0 {
+		return payments.GetECBalanceID(payment.ExtraCurrencyID), nil, nil
+	}
+
+	return payments.GetTONBalanceID(), nil, nil
 }
 
 func paymentConfigToSections(s *config.TunnelRouteSection, isOut bool, pay *tonpayments.Service) (*SectionInfo, error) {
@@ -606,16 +622,12 @@ func paymentConfigToSections(s *config.TunnelRouteSection, isOut bool, pay *tonp
 	if s.Payment != nil && pay != nil {
 		var ptn []PaymentTunnelSection
 
-		var jetton *address.Address
-		var jettonStr string
-		if s.Payment.JettonMaster != nil {
-			if jetton, err = address.ParseAddr(*s.Payment.JettonMaster); err != nil {
-				return nil, fmt.Errorf("invalid jetton master address: %w", err)
-			}
-			jettonStr = jetton.Bounce(true).String()
+		balanceID, jetton, err := paymentBalanceID(s.Payment)
+		if err != nil {
+			return nil, err
 		}
 
-		cc, err := pay.ResolveCoinConfig(jettonStr, s.Payment.ExtraCurrencyID, true)
+		cc, err := pay.ResolveCoinConfig(balanceID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve coin config: %w", err)
 		}
@@ -653,6 +665,7 @@ func paymentConfigToSections(s *config.TunnelRouteSection, isOut bool, pay *tonp
 			PricePerPacket:  price,
 			JettonMaster:    jetton,
 			ExtraCurrencyID: s.Payment.ExtraCurrencyID,
+			BalanceID:       balanceID,
 		}
 	}
 

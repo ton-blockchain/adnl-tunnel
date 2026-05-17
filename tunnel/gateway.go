@@ -11,7 +11,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/ton-blockchain/adnl-tunnel/metrics"
-	"github.com/xssnick/ton-payment-network/pkg/payments"
+	"github.com/xssnick/ton-payment-network/pkg/payments/conditionals"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/dht"
@@ -27,6 +27,10 @@ import (
 )
 
 var crcTable = crc64.MakeTable(crc64.ECMA)
+
+var MaxInboundSections = 4096
+var MaxInboundSectionsPerPeer = 64
+var InboundSectionPendingTTL = 10 * time.Second
 
 func init() {
 	tl.Register(Ping{}, "adnlTunnel.ping seqno:long = adnlTunnel.Ping")
@@ -58,7 +62,7 @@ type Route struct {
 	PacketsRouted uint64
 	Section       *Section
 
-	PaymentReceived bool
+	PaymentReceived int32
 	PrepaidPackets  int64
 	rate            *leakybucket.LeakyBucket
 }
@@ -101,7 +105,7 @@ type PaymentChannel struct {
 	Active      bool
 	Deadline    int64
 	Capacity    *big.Int
-	LatestState *payments.VirtualChannelState
+	LatestState *conditionals.VirtualChannelState
 
 	Purpose uint64
 
@@ -117,6 +121,11 @@ type SeqnoWindow struct {
 type Section struct {
 	gw           *Gateway
 	lastPacketAt int64
+	admittedAt   int64
+	keyID        [32]byte
+	ownerPeer    [32]byte
+	protected    int32
+	closed       int32
 
 	key          []byte
 	cipherKey    []byte
@@ -163,7 +172,8 @@ type Gateway struct {
 	bufPool sync.Pool
 
 	log             zerolog.Logger
-	inboundSections map[string]*Section
+	inboundSections map[[32]byte]*Section
+	sectionsByPeer  map[[32]byte]int
 	mx              sync.RWMutex
 }
 
@@ -209,7 +219,8 @@ func NewGateway(gate *adnl.Gateway, dht *dht.Client, key ed25519.PrivateKey, log
 		tunnels:          map[uint32]Tunnel{},
 		log:              logger,
 		payments:         pay,
-		inboundSections:  map[string]*Section{},
+		inboundSections:  map[[32]byte]*Section{},
+		sectionsByPeer:   map[[32]byte]int{},
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				return make([]byte, 2048)
@@ -238,6 +249,138 @@ func (g *Gateway) requestCheckPeers() {
 	case g.signalCheckPeers <- struct{}{}:
 	default:
 	}
+}
+
+func key32(name string, key []byte) ([32]byte, error) {
+	var id [32]byte
+	if len(key) != len(id) {
+		return id, fmt.Errorf("invalid %s len %d", name, len(key))
+	}
+	copy(id[:], key)
+	return id, nil
+}
+
+func (g *Gateway) newInboundSection(peer *Peer, m *EncryptedMessage) (*Section, error) {
+	secID, err := key32("section pub key", m.SectionPubKey)
+	if err != nil {
+		return nil, err
+	}
+	peerID, err := key32("peer id", peer.id)
+	if err != nil {
+		return nil, err
+	}
+
+	shKey, err := keys.SharedKey(g.key, m.SectionPubKey)
+	if err != nil {
+		return nil, fmt.Errorf("shared key calc failed: %v", err)
+	}
+
+	now := time.Now().Unix()
+	return &Section{
+		key:          m.SectionPubKey,
+		keyID:        secID,
+		gw:           g,
+		cipherKey:    shKey,
+		cipherKeyCrc: crc64.Checksum(shKey, crcTable),
+		routes:       map[uint32]*Route{},
+		payments:     map[string]*PaymentChannel{},
+		lastPacketAt: now,
+		admittedAt:   now,
+		ownerPeer:    peerID,
+		log: g.log.With().
+			Str("from_addr", peer.getAddr()).
+			Str("from_adnl", base64.StdEncoding.EncodeToString(peer.id)).
+			Str("tunnel", base64.StdEncoding.EncodeToString(m.SectionPubKey)).Logger(),
+	}, nil
+}
+
+func (g *Gateway) admitInboundSection(sec *Section) (*Section, bool, error) {
+	var evicted []*Section
+	now := time.Now().Unix()
+
+	g.mx.Lock()
+	if existing := g.inboundSections[sec.keyID]; existing != nil {
+		g.mx.Unlock()
+		return existing, false, nil
+	}
+
+	if g.sectionsByPeer[sec.ownerPeer] >= MaxInboundSectionsPerPeer {
+		victim := g.detachInboundSectionVictimLocked(now, sec.ownerPeer)
+		if victim == nil {
+			g.mx.Unlock()
+			return nil, false, fmt.Errorf("too many inbound sections for peer")
+		}
+		evicted = append(evicted, victim)
+	}
+
+	if len(g.inboundSections) >= MaxInboundSections {
+		victim := g.detachInboundSectionVictimLocked(now, [32]byte{})
+		if victim == nil {
+			g.mx.Unlock()
+			return nil, false, fmt.Errorf("too many inbound sections")
+		}
+		evicted = append(evicted, victim)
+	}
+
+	g.inboundSections[sec.keyID] = sec
+	g.sectionsByPeer[sec.ownerPeer]++
+	g.mx.Unlock()
+
+	for _, victim := range evicted {
+		victim.close()
+	}
+
+	metrics.ActiveInboundSections.Inc()
+	sec.log.Info().Msg("inbound section created")
+	return sec, true, nil
+}
+
+func (g *Gateway) detachInboundSectionVictimLocked(now int64, ownerPeer [32]byte) *Section {
+	var victim, fallback *Section
+	for _, section := range g.inboundSections {
+		if ownerPeer != [32]byte{} && section.ownerPeer != ownerPeer {
+			continue
+		}
+		if atomic.LoadInt32(&section.protected) != 0 {
+			continue
+		}
+		if fallback == nil || section.admittedAt < fallback.admittedAt {
+			fallback = section
+		}
+		if now-atomic.LoadInt64(&section.lastPacketAt) >= int64(InboundSectionPendingTTL/time.Second) &&
+			(victim == nil || section.admittedAt < victim.admittedAt) {
+			victim = section
+		}
+	}
+	if victim == nil {
+		victim = fallback
+	}
+	if victim != nil {
+		g.detachInboundSectionLocked(victim)
+	}
+	return victim
+}
+
+func (g *Gateway) detachInboundSectionLocked(section *Section) bool {
+	if g.inboundSections[section.keyID] != section {
+		return false
+	}
+
+	delete(g.inboundSections, section.keyID)
+	if n := g.sectionsByPeer[section.ownerPeer]; n > 1 {
+		g.sectionsByPeer[section.ownerPeer] = n - 1
+	} else {
+		delete(g.sectionsByPeer, section.ownerPeer)
+	}
+	metrics.ActiveInboundSections.Dec()
+	return true
+}
+
+func (g *Gateway) removeInboundSection(section *Section) bool {
+	g.mx.Lock()
+	ok := g.detachInboundSectionLocked(section)
+	g.mx.Unlock()
+	return ok
 }
 
 func (g *Gateway) speedMetricsUpdater() {
@@ -270,8 +413,8 @@ func (g *Gateway) GetPacketsStats() map[string]*SectionStats {
 	res := map[string]*SectionStats{}
 
 	g.mx.RLock()
-	for s, section := range g.inboundSections {
-		tmp[s] = section
+	for _, section := range g.inboundSections {
+		tmp[string(section.key)] = section
 	}
 	g.mx.RUnlock()
 
@@ -338,7 +481,9 @@ func (g *Gateway) Start() error {
 			case <-g.closerCtx.Done():
 				return
 			case <-time.After(after):
-				if len(g.gate.GetAddressList().Addresses) > 0 {
+				if g.dht == nil {
+					g.log.Debug().Msg("skipping dht because client is not configured")
+				} else if len(g.gate.GetAddressList().Addresses) > 0 {
 					g.log.Debug().Msg("updating dht")
 					ctx, cancel := context.WithTimeout(g.closerCtx, 300*time.Second)
 					err := g.updateDHT(ctx, 20*60)
@@ -381,8 +526,20 @@ func (g *Gateway) keepAlivePeersAndSections() {
 			var sectionsToClose []*Section
 			var paymentsToClose []*PaymentChannel
 
+			var peers []*Peer
+			var sections []*Section
 			g.mx.RLock()
+			peers = make([]*Peer, 0, len(g.activePeers))
 			for _, peer := range g.activePeers {
+				peers = append(peers, peer)
+			}
+			sections = make([]*Section, 0, len(g.inboundSections))
+			for _, section := range g.inboundSections {
+				sections = append(sections, section)
+			}
+			g.mx.RUnlock()
+
+			for _, peer := range peers {
 				g.log.Trace().Int64("refs", atomic.LoadInt64(&peer.references)).Str("id", base64.StdEncoding.EncodeToString(peer.id)).Int64("inactive", tm-peer.LastPacketFromAt).Bool("connected", peer.getConn() != nil).Msg("checking peer")
 
 				if atomic.LoadInt64(&peer.references) == 0 && tm-peer.CreatedAt > 10 {
@@ -396,6 +553,9 @@ func (g *Gateway) keepAlivePeersAndSections() {
 				}
 
 				if conn := peer.getConn(); conn == nil {
+					if g.dht == nil {
+						continue
+					}
 					if atomic.LoadInt32(&peer.discoverInProgress) == 0 {
 						go func(peer *Peer) {
 							g.log.Debug().Str("id", base64.StdEncoding.EncodeToString(peer.id)).Msg("discovering peer")
@@ -422,12 +582,14 @@ func (g *Gateway) keepAlivePeersAndSections() {
 				}
 			}
 
-			for _, section := range g.inboundSections {
+			for _, section := range sections {
 				if !section.mx.TryLock() {
 					continue
 				}
 
-				if atomic.LoadInt64(&section.lastPacketAt) < tm-SectionMaxInactiveSec {
+				if atomic.LoadInt32(&section.protected) == 0 && tm-atomic.LoadInt64(&section.lastPacketAt) > int64(InboundSectionPendingTTL/time.Second) {
+					sectionsToClose = append(sectionsToClose, section)
+				} else if atomic.LoadInt64(&section.lastPacketAt) < tm-SectionMaxInactiveSec {
 					sectionsToClose = append(sectionsToClose, section)
 				} else {
 					for k, channel := range section.payments {
@@ -442,13 +604,10 @@ func (g *Gateway) keepAlivePeersAndSections() {
 				}
 				section.mx.Unlock()
 			}
-			g.mx.RUnlock()
 
 			for _, section := range sectionsToClose {
 				if section.closeIfNotLocked() {
-					g.mx.Lock()
-					delete(g.inboundSections, string(section.key))
-					g.mx.Unlock()
+					g.removeInboundSection(section)
 				}
 			}
 
@@ -473,8 +632,13 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 			atomic.StoreUint64(&peer.pongSeqno, m.Seqno)
 			g.log.Trace().Str("peer", base64.StdEncoding.EncodeToString(peer.id)).Str("addr", peer.getAddr()).Msg("pong received")
 		case EncryptedMessageCached:
+			secID, err := key32("section pub key", m.SectionPubKey)
+			if err != nil {
+				return err
+			}
+
 			g.mx.RLock()
-			sec := g.inboundSections[string(m.SectionPubKey)]
+			sec := g.inboundSections[secID]
 			g.mx.RUnlock()
 
 			if sec == nil {
@@ -498,37 +662,22 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 				}
 			}
 		case EncryptedMessage:
+			secID, err := key32("section pub key", m.SectionPubKey)
+			if err != nil {
+				return err
+			}
+
 			g.mx.RLock()
-			sec := g.inboundSections[string(m.SectionPubKey)]
+			sec := g.inboundSections[secID]
 			g.mx.RUnlock()
 
-			// TODO: random tunnel creation ddos protection
+			isNew, inserted := false, false
 			if sec == nil {
-				shKey, err := keys.SharedKey(g.key, m.SectionPubKey)
+				isNew = true
+				sec, err = g.newInboundSection(peer, &m)
 				if err != nil {
-					return fmt.Errorf("shared key calc failed: %v", err)
+					return err
 				}
-
-				sec = &Section{
-					key:          m.SectionPubKey,
-					gw:           g,
-					cipherKey:    shKey,
-					cipherKeyCrc: crc64.Checksum(shKey, crcTable),
-					routes:       map[uint32]*Route{},
-					payments:     map[string]*PaymentChannel{},
-					lastPacketAt: time.Now().Unix(),
-					log: g.log.With().
-						Str("from_addr", peer.getConn().RemoteAddr()).
-						Str("from_adnl", base64.StdEncoding.EncodeToString(peer.id)).
-						Str("tunnel", base64.StdEncoding.EncodeToString(m.SectionPubKey)).Logger(),
-				}
-				sec.log.Info().Msg("inbound section created")
-
-				g.mx.Lock()
-				g.inboundSections[string(m.SectionPubKey)] = sec
-				g.mx.Unlock()
-
-				metrics.ActiveInboundSections.Inc()
 			}
 
 			container, restInstructions, err := sec.decryptMessage(&m)
@@ -536,20 +685,35 @@ func (g *Gateway) messageHandler(peer *Peer) func(msg *adnl.MessageCustom) error
 				return fmt.Errorf("decrypt failed: %w", err)
 			}
 
-			if !sec.checkSeqno(container.Seqno, false) {
-				sec.logOnce().Uint32("seqno", container.Seqno).Uint32("last_seqno", sec.seqno.latest).Msg("repeating instructions packet")
-
-				return fmt.Errorf("repeating instructions packet")
-			}
-
 			if len(container.List) > 5 {
 				return fmt.Errorf("too many instructions")
+			}
+
+			if isNew {
+				sec, inserted, err = g.admitInboundSection(sec)
+				if err != nil {
+					return err
+				}
+			}
+
+			if !sec.checkSeqno(container.Seqno, false) {
+				sec.logOnce().Uint32("seqno", container.Seqno).Uint32("last_seqno", sec.seqno.latest).Msg("repeating instructions packet")
+				if inserted {
+					g.removeInboundSection(sec)
+					sec.close()
+				}
+
+				return fmt.Errorf("repeating instructions packet")
 			}
 
 			atomic.StoreInt64(&sec.lastPacketAt, time.Now().Unix())
 			for i, inst := range container.List {
 				if err = inst.(Instruction).Execute(g.closerCtx, sec, &m, restInstructions); err != nil {
 					sec.logOnce().Int("index", i).Type("instruction", inst).Err(err).Msg("execute instruction failed")
+					if inserted {
+						g.removeInboundSection(sec)
+						sec.close()
+					}
 					return fmt.Errorf("execute instruction %d (%T) error: %w", i, inst, err)
 				}
 			}
@@ -658,7 +822,7 @@ func (g *Gateway) closePaymentChannel(ch *PaymentChannel) error {
 
 	log.Info().Str("amount", ch.LatestState.Amount.String()).
 		Str("key", base64.StdEncoding.EncodeToString(ch.Key)).Msg("closing payment channel")
-	if err := g.payments.Service.CloseVirtualChannel(context.Background(), ch.Key); err != nil {
+	if err := g.payments.Service.CloseConditional(context.Background(), ch.Key); err != nil {
 		g.log.Warn().Err(err).Hex("key", ch.Key).Msg("failed to close virtual payment channel")
 	}
 	return nil
@@ -669,6 +833,22 @@ func (s *Section) closeIfNotLocked() bool {
 		return false
 	}
 	defer s.mx.Unlock()
+
+	s.closeResourcesLocked()
+	return true
+}
+
+func (s *Section) close() {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	s.closeResourcesLocked()
+}
+
+func (s *Section) closeResourcesLocked() {
+	if !atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
+		return
+	}
 
 	for _, ch := range s.payments {
 		_ = s.gw.closePaymentChannel(ch)
@@ -683,8 +863,4 @@ func (s *Section) closeIfNotLocked() bool {
 		s.out.Close()
 	}
 	s.log.Debug().Msg("section closed")
-
-	metrics.ActiveInboundSections.Dec()
-
-	return true
 }

@@ -83,6 +83,48 @@ type SharedConfig struct {
 	NodesPool []TunnelRouteSection
 }
 
+func normalizeCoinConfig(cc configPayments.CoinConfig) configPayments.CoinConfig {
+	if cc.VirtualTunnelConfig.MaxCapacityToRentPerTx == "" {
+		cc.VirtualTunnelConfig.MaxCapacityToRentPerTx = "0"
+	}
+	if cc.VirtualTunnelConfig.CapacityDepositFee == "" {
+		cc.VirtualTunnelConfig.CapacityDepositFee = "0"
+	}
+	if cc.VirtualTunnelConfig.ProxyMaxCapacity == "" {
+		cc.VirtualTunnelConfig.ProxyMaxCapacity = "0"
+	}
+	if cc.VirtualTunnelConfig.ProxyMinFee == "" {
+		cc.VirtualTunnelConfig.ProxyMinFee = "0"
+	}
+	if cc.MinCapacityRequest == "" {
+		cc.MinCapacityRequest = "0"
+	}
+	if cc.FeePerWithdrawPropose == "" {
+		cc.FeePerWithdrawPropose = "0"
+	}
+	return cc
+}
+
+func NormalizeChannelsConfig(cfg *configPayments.ChannelsConfig) {
+	cfg.SupportedCoins.Ton = normalizeCoinConfig(cfg.SupportedCoins.Ton)
+	for key, cc := range cfg.SupportedCoins.Jettons {
+		cfg.SupportedCoins.Jettons[key] = normalizeCoinConfig(cc)
+	}
+	for key, cc := range cfg.SupportedCoins.ExtraCurrencies {
+		cfg.SupportedCoins.ExtraCurrencies[key] = normalizeCoinConfig(cc)
+	}
+	if cfg.ActionsDuration == 0 {
+		cfg.ActionsDuration = 2 * 3600
+	}
+	if cfg.ReplicationMessageAttachAmount == "" {
+		cfg.ReplicationMessageAttachAmount = "0.1"
+	}
+}
+
+func NormalizeClientConfig(cfg *ClientConfig) {
+	NormalizeChannelsConfig(&cfg.Payments.ChannelsConfig)
+}
+
 func checkIPAddress(ip string) string {
 	p := net.ParseIP(ip)
 	if p == nil {
@@ -116,9 +158,18 @@ func checkCanSeed() (string, bool) {
 			return
 		}
 		defer listen.Close()
+		go func() {
+			<-ctx.Done()
+			_ = listen.Close()
+		}()
 
 		conn, err := listen.Accept()
 		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			log.Error().Err(err).Str("source", "port checker").Msg("accept err")
 			return
 		}
@@ -144,10 +195,11 @@ func checkCanSeed() (string, bool) {
 	}
 	log.Info().Msg("port checker resolved, using port checker at tonutils.com")
 
-	conn, err := net.Dial("tcp", ips[0].String()+":9099")
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", ips[0].String()+":9099")
 	if err != nil {
 		return "", false
 	}
+	defer conn.Close()
 
 	_, err = conn.Write([]byte("ME"))
 	if err != nil {
@@ -176,7 +228,7 @@ func LoadConfig(path string) (*Config, error) {
 	_, err = os.Stat(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			err = os.MkdirAll(dir, os.ModePerm)
+			err = os.MkdirAll(dir, 0700)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to check directory: %w", err)
@@ -227,47 +279,55 @@ func LoadConfig(path string) (*Config, error) {
 						Ton: configPayments.CoinConfig{
 							Enabled: true,
 							VirtualTunnelConfig: configPayments.VirtualConfig{
-								ProxyMaxCapacity: "0",
-								ProxyMinFee:      "0",
-								ProxyFeePercent:  0,
-								AllowTunneling:   false,
+								MaxCapacityToRentPerTx:      "5",
+								CapacityDepositFee:          "0.05",
+								CapacityFeePercentPer30Days: 0.1,
+								ProxyMaxCapacity:            "0",
+								ProxyMinFee:                 "0",
+								ProxyFeePercent:             0,
+								AllowTunneling:              false,
 							},
 							BalanceControl: &configPayments.BalanceControlConfig{
 								DepositWhenAmountLessThan: "0",
 								DepositUpToAmount:         "0",
 								WithdrawWhenAmountReached: "5",
 							},
-							MisbehaviorFine: "3",
-							ExcessFeeTon:    "0.25",
-							Symbol:          "TON",
-							Decimals:        9,
+							Symbol:                "TON",
+							Decimals:              9,
+							MinCapacityRequest:    "1",
+							FeePerWithdrawPropose: "0.05",
 						},
 						Jettons: map[string]configPayments.CoinConfig{
 							"EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs": {
 								Enabled: false,
 								VirtualTunnelConfig: configPayments.VirtualConfig{
-									ProxyMaxCapacity: "0",
-									ProxyMinFee:      "0",
-									ProxyFeePercent:  0,
-									AllowTunneling:   false,
+									MaxCapacityToRentPerTx:      "10",
+									CapacityDepositFee:          "0.3",
+									CapacityFeePercentPer30Days: 0.1,
+									ProxyMaxCapacity:            "0",
+									ProxyMinFee:                 "0",
+									ProxyFeePercent:             0,
+									AllowTunneling:              false,
 								},
 								BalanceControl: &configPayments.BalanceControlConfig{
 									DepositWhenAmountLessThan: "0",
 									DepositUpToAmount:         "0",
 									WithdrawWhenAmountReached: "15",
 								},
-								MisbehaviorFine: "12",
-								ExcessFeeTon:    "0.35",
-								Symbol:          "USDT",
-								Decimals:        6,
+								Symbol:                "USDT",
+								Decimals:              6,
+								MinCapacityRequest:    "3",
+								FeePerWithdrawPropose: "0.3",
 							},
 						},
 						ExtraCurrencies: map[uint32]configPayments.CoinConfig{},
 					},
 					BufferTimeToCommit:              3 * 3600,
 					QuarantineDurationSec:           6 * 3600,
+					ActionsDuration:                 2 * 3600,
 					ConditionalCloseDurationSec:     3 * 3600,
 					MinSafeVirtualChannelTimeoutSec: 300,
+					ReplicationMessageAttachAmount:  "0.1",
 				},
 			},
 		}
@@ -291,6 +351,7 @@ func LoadConfig(path string) (*Config, error) {
 		if err = json.Unmarshal(data, &cfg); err != nil {
 			return nil, err
 		}
+		NormalizeChannelsConfig(&cfg.Payments.ChannelsConfig)
 		return &cfg, nil
 	}
 
@@ -340,46 +401,55 @@ func GenerateClientConfig() (*ClientConfig, error) {
 					Ton: configPayments.CoinConfig{
 						Enabled: true,
 						VirtualTunnelConfig: configPayments.VirtualConfig{
-							ProxyMinFee:     "0",
-							ProxyFeePercent: 0,
-							AllowTunneling:  false,
+							MaxCapacityToRentPerTx:      "5",
+							CapacityDepositFee:          "0.05",
+							CapacityFeePercentPer30Days: 0.1,
+							ProxyMaxCapacity:            "0",
+							ProxyMinFee:                 "0",
+							ProxyFeePercent:             0,
+							AllowTunneling:              false,
 						},
 						BalanceControl: &configPayments.BalanceControlConfig{
 							DepositWhenAmountLessThan: "1",
 							DepositUpToAmount:         "3",
 							WithdrawWhenAmountReached: "0",
 						},
-						MisbehaviorFine: "3",
-						ExcessFeeTon:    "0.25",
-						Symbol:          "TON",
-						Decimals:        9,
+						Symbol:                "TON",
+						Decimals:              9,
+						MinCapacityRequest:    "1",
+						FeePerWithdrawPropose: "0.05",
 					},
 					Jettons: map[string]configPayments.CoinConfig{
 						"EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs": {
 							Enabled: false,
 							VirtualTunnelConfig: configPayments.VirtualConfig{
-								ProxyMaxCapacity: "0",
-								ProxyMinFee:      "0",
-								ProxyFeePercent:  0,
-								AllowTunneling:   false,
+								MaxCapacityToRentPerTx:      "10",
+								CapacityDepositFee:          "0.3",
+								CapacityFeePercentPer30Days: 0.1,
+								ProxyMaxCapacity:            "0",
+								ProxyMinFee:                 "0",
+								ProxyFeePercent:             0,
+								AllowTunneling:              false,
 							},
 							BalanceControl: &configPayments.BalanceControlConfig{
 								DepositWhenAmountLessThan: "5",
 								DepositUpToAmount:         "10",
 								WithdrawWhenAmountReached: "0",
 							},
-							MisbehaviorFine: "12",
-							ExcessFeeTon:    "0.35",
-							Symbol:          "USDT",
-							Decimals:        6,
+							Symbol:                "USDT",
+							Decimals:              6,
+							MinCapacityRequest:    "3",
+							FeePerWithdrawPropose: "0.3",
 						},
 					},
 					ExtraCurrencies: map[uint32]configPayments.CoinConfig{},
 				},
 				BufferTimeToCommit:              3 * 3600,
 				QuarantineDurationSec:           6 * 3600,
+				ActionsDuration:                 2 * 3600,
 				ConditionalCloseDurationSec:     3 * 3600,
 				MinSafeVirtualChannelTimeoutSec: 300,
+				ReplicationMessageAttachAmount:  "0.1",
 			},
 		},
 	}
@@ -424,7 +494,7 @@ func SaveConfig(cfg any, path string) error {
 	_, err := os.Stat(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			err = os.MkdirAll(dir, os.ModePerm)
+			err = os.MkdirAll(dir, 0700)
 		}
 		if err != nil {
 			return fmt.Errorf("failed to check directory: %w", err)
@@ -436,9 +506,8 @@ func SaveConfig(cfg any, path string) error {
 		return err
 	}
 
-	err = os.WriteFile(path, data, 0766)
-	if err != nil {
+	if err = os.WriteFile(path, data, 0600); err != nil {
 		return err
 	}
-	return nil
+	return os.Chmod(path, 0600)
 }

@@ -23,7 +23,7 @@ type OverlayKey struct {
 
 func (g *Gateway) updateDHT(ctx context.Context, ttlSeconds int64) error {
 	addr := g.gate.GetAddressList()
-	stored, _, err := g.dht.StoreAddress(ctx, addr, time.Duration(ttlSeconds)*time.Second, g.key, 0)
+	stored, _, err := g.dht.StoreAddress(ctx, addr, time.Duration(ttlSeconds)*time.Second, g.key)
 	if err != nil && stored == 0 {
 		return fmt.Errorf("failed to store address: %w", err)
 	}
@@ -56,17 +56,21 @@ func (g *Gateway) updateDHT(ctx context.Context, ttlSeconds int64) error {
 
 	refreshed := false
 	var newList []overlay.Node
+	selfID := node.ID.(keys.PublicKeyED25519)
+	cutoff := time.Now().Unix() - ttlSeconds
 	// refresh if already exists
 	for i := range nodesList.List {
 		id, ok := nodesList.List[i].ID.(keys.PublicKeyED25519)
-		if ok && id.Key.Equal(node.ID.(keys.PublicKeyED25519).Key) {
-			newList = append(newList, *node)
+		if ok && id.Key.Equal(selfID.Key) {
+			if !refreshed {
+				newList = append(newList, *node)
+			}
 			refreshed = true
-			break
+			continue
 		}
 
 		// cleanup outdated ???
-		if uint32(nodesList.List[i].Version) > uint32(time.Now().Unix()-ttlSeconds) {
+		if int64(nodesList.List[i].Version) > cutoff {
 			newList = append(newList, nodesList.List[i])
 		}
 	}
@@ -96,7 +100,7 @@ func (g *Gateway) updateDHT(ctx context.Context, ttlSeconds int64) error {
 		}
 	}
 
-	ovStored, _, err := g.dht.StoreOverlayNodes(ctx, overlayKey, nodesList, time.Duration(ttlSeconds)*time.Second, 0)
+	ovStored, _, err := g.dht.StoreOverlayNodes(ctx, overlayKey, nodesList, time.Duration(ttlSeconds)*time.Second)
 	if err != nil {
 		return fmt.Errorf("failed to store overlay nodes: %w", err)
 	}

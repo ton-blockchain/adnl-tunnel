@@ -16,9 +16,11 @@ import (
 	"github.com/ton-blockchain/adnl-tunnel/config"
 	"github.com/ton-blockchain/adnl-tunnel/metrics"
 	"github.com/ton-blockchain/adnl-tunnel/tunnel"
+	"github.com/xssnick/ton-payment-network/pkg/payments"
 	"github.com/xssnick/ton-payment-network/tonpayments"
 	"github.com/xssnick/ton-payment-network/tonpayments/chain"
 	chainClient "github.com/xssnick/ton-payment-network/tonpayments/chain/client"
+	configPayments "github.com/xssnick/ton-payment-network/tonpayments/config"
 	"github.com/xssnick/ton-payment-network/tonpayments/db"
 	"github.com/xssnick/ton-payment-network/tonpayments/db/leveldb"
 	"github.com/xssnick/ton-payment-network/tonpayments/transport"
@@ -172,8 +174,8 @@ func main() {
 			log.Fatal().Msg("Invalid external IP address")
 			return
 		}
-		gate.SetAddressList([]*address.UDP{
-			{
+		gate.SetAddressList([]address.Address{
+			&address.UDP{
 				IP:   ip.To4(),
 				Port: int32(listenAddr.Port()),
 			},
@@ -320,12 +322,16 @@ func main() {
 
 			amount := big.NewInt(0)
 			for _, channel := range list {
-				v, _, err := channel.CalcBalance(val == "capacity")
+				balances, err := channel.CalcBalance(context.Background(), val == "capacity", pmt.Service)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to calc channel balance")
 					continue
 				}
-				amount = amount.Add(amount, v)
+				tonBalance := balances[payments.GetTONBalanceID()]
+				if tonBalance == nil {
+					continue
+				}
+				amount = amount.Add(amount, tonBalance.Available())
 			}
 
 			if val == "balance" {
@@ -503,8 +509,8 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 	}
 
 	inv := make(chan any)
-	sc := chain.NewScanner(apiClient, seqno, scanLog)
-	if err = sc.StartSmall(inv); err != nil {
+	sc := chain.NewScanner(apiClient, seqno, scanLog, inv)
+	if err = sc.Start(ctx); err != nil {
 		log.Fatal().Err(err).Msg("failed to start scanner")
 		return nil, nil, nil
 	}
@@ -529,7 +535,7 @@ func preparePayments(ctx context.Context, gCfg *liteclient.GlobalConfig, dhtClie
 	}
 	log.Info().Str("addr", w.WalletAddress().String()).Msg("wallet initialized")
 
-	svc, err := tonpayments.NewService(chainClient.NewTON(apiClient), fdb, tr, nil, w, inv, nodePrv, cfg.Payments.ChannelsConfig, *MetricsAddr != "")
+	svc, err := tonpayments.NewService(chainClient.NewTON(apiClient), fdb, tr, nil, w, inv, nodePrv, cfg.Payments.ChannelsConfig, configPayments.VaultConfig{}, *MetricsAddr != "")
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to init payments service")
 		return nil, nil, nil
@@ -548,19 +554,21 @@ func preparePaymentChannel(ctx context.Context, pmt *tonpayments.Service, ch []b
 
 	var best []byte
 	var bestAmount = big.NewInt(0)
+	tonBalanceID := payments.GetTONBalanceID()
 	for _, channel := range list {
 		if len(ch) > 0 {
-			if bytes.Equal(channel.TheirOnchain.Key, ch) {
+			if bytes.Equal(channel.Their.OnchainInfo.Key, ch) {
 				// we have specified channel already deployed
-				return channel.TheirOnchain.Key, nil
+				return channel.Their.OnchainInfo.Key, nil
 			}
 			continue
 		}
 
 		// if specific channel not defined we select the channel with the biggest deposit
-		if channel.TheirOnchain.Deposited.Cmp(bestAmount) >= 0 {
-			bestAmount = channel.TheirOnchain.Deposited
-			best = channel.TheirOnchain.Key
+		deposited := channel.Their.OnchainBalances[tonBalanceID]
+		if deposited != nil && deposited.Cmp(bestAmount) >= 0 {
+			bestAmount = deposited
+			best = channel.Their.OnchainInfo.Key
 		}
 	}
 
@@ -588,7 +596,7 @@ func preparePaymentChannel(ctx context.Context, pmt *tonpayments.Service, ch []b
 	}
 
 	ctxTm, cancel := context.WithTimeout(context.Background(), 150*time.Second)
-	addr, err := pmt.OpenChannelWithNode(ctxTm, ch, nil, 0)
+	addr, err := pmt.OpenChannelWithNode(ctxTm, ch)
 	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("failed to deploy channel with node: %w", err)
@@ -605,7 +613,9 @@ func preparePaymentChannel(ctx context.Context, pmt *tonpayments.Service, ch []b
 			return nil, fmt.Errorf("failed to get channel: %w", err)
 		}
 
-		if !channel.Our.IsReady() || !channel.Their.IsReady() {
+		if channel.Status != db.ChannelStateActive ||
+			len(channel.Our.OnchainInfo.Key) != ed25519.PublicKeySize ||
+			len(channel.Their.OnchainInfo.Key) != ed25519.PublicKeySize {
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
