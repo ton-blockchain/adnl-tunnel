@@ -62,10 +62,10 @@ github.com/syndtr/goleveldb v1.0.0 h1:fBdIW9lB4Iz0n9khmH8w27SJ3QEJ7+IgjPEwGSZiFd
 github.com/syndtr/goleveldb v1.0.0/go.mod h1:ZVVdQEZoIme9iO1Ch2Jdy24qqXrMMOU6lpPAyBWyWuQ=
 github.com/xssnick/raptorq v1.4.0 h1:Bms8lgT7aEPRP8YBRuS+8w7Cic8GP9BbvFT1NrWvi24=
 github.com/xssnick/raptorq v1.4.0/go.mod h1:mo5n6T4yaqZkNVMWonRuMS0tcyD4XQ6PwwTjaY3ZwQY=
-github.com/xssnick/ton-payment-network v1.3.0 h1:GCLuMjsr24A8Tj1yL1qivSt9w3tXw/iNCpKSmOwmZXs=
-github.com/xssnick/ton-payment-network v1.3.0/go.mod h1:QbbM7tAahsEEDHa2d87gUtq4DuIagouub+UW7emsd3g=
-github.com/xssnick/tonutils-go v1.17.0 h1:+th/6fDF3PrwSndIYIkk9A/v2W6sT6CXy10yFKXBwGA=
-github.com/xssnick/tonutils-go v1.17.0/go.mod h1:D6EgtZo8DKZrjKwAAcNumc1zAwIesCXjWYhNNu4yrbs=
+github.com/xssnick/ton-payment-network v1.3.1 h1:cTznym+dTxqwRBbpFFoXdY5WEfccJxXDLG0Vd5LD+R0=
+github.com/xssnick/ton-payment-network v1.3.1/go.mod h1:IJehZeEGhmu8mcA3dWBBJ+ZSFZYWs7w13IwP6nThiNc=
+github.com/xssnick/tonutils-go v1.17.2 h1:WMBjyqJsgnZuc3UU/shxia47DQLjK+3oJtK0Xx2qgIg=
+github.com/xssnick/tonutils-go v1.17.2/go.mod h1:Ind3q0JM2N/63zfWR7rSGmUpUZaiGxregm9nZc/xGx4=
 go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=
 go.uber.org/goleak v1.3.0/go.mod h1:CoHD4mav9JJNrW/WLlf7HGZPjdw8EucARQHekz1X6bE=
 go.yaml.in/yaml/v2 v2.4.2 h1:DzmwEr2rDGHl7lsFgAHxmNz/1NlQ7xLIrlN2h5d1eGI=

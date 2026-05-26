@@ -7,8 +7,8 @@ require (
 	github.com/natefinch/lumberjack v2.0.0+incompatible
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.35.1
-	github.com/xssnick/ton-payment-network v1.3.0
-	github.com/xssnick/tonutils-go v1.17.0
+	github.com/xssnick/ton-payment-network v1.3.1
+	github.com/xssnick/tonutils-go v1.17.2
 )
 
 require (
